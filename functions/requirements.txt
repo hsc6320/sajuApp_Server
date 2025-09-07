@@ -1,0 +1,12 @@
+firebase-functions
+functions-framework
+openai
+python-dotenv
+firebase-admin
+flask
+
+# LangChain 패키지 및 버전 고정
+langchain==0.1.9
+langchain-core==0.1.27
+langchain-openai==0.0.8
+langchain-community==0.0.21
