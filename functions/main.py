@@ -4,7 +4,7 @@ import os
 import json 
 from dotenv import load_dotenv
 from converting_time import extract_target_ganji_v2
-from extract_entity import extract_entities_for_summary, enrich_summary_with_entities
+from extract_entity import extract_entities_for_summary, enrich_summary_with_entities, quick_lookup_from_facts
 from sip_e_un_sung import unseong_for, branch_for, pillars_unseong, seun_unseong
 from converting_time import convert_relative_time
 from Sipsin import get_sipshin, get_ji_sipshin_only
@@ -540,69 +540,28 @@ def set_summary_text(text: str) -> None:
     except Exception as e:
         print(f"[summary] set 실패: {e}")
 
+def record_turn(user_text: str, assistant_text: str, payload: dict | None = None):
+    """대화 1턴 저장 + LangChain 요약 갱신 + FACTS 병합"""
 
-def record_turn(user_text: str, assistant_text: str, payload: dict = None):
-    """대화 1턴을 메모리에 기록 + 요약 즉시 업데이트 + FACTS 누적 (라운드트립 로깅 포함)"""
-    print("\n================= record_turn start =================")
-
-    # 0) 원문 로그
-    print(f"[TURN] user: {user_text}")
-    print(f"[TURN] assistant: {assistant_text[:200]}{'...' if len(assistant_text)>200 else ''}")
-
-    # 1) LangChain 메모리에 대화 저장
+    # 1) LangChain 메모리에 원문 저장(요약 자동 업데이트 트리거)
     try:
         global_memory.save_context({"input": user_text}, {"output": assistant_text})
-        _ = global_memory.load_memory_variables({})  # 내부 요약 즉시 갱신
-        print("[MEM] save_context + load_memory_variables OK")
+        _ = global_memory.load_memory_variables({})   # 내부 요약 즉시 계산
     except Exception as e:
-        print(f"[MEM] save_context 실패: {e}")
+        print(f"[memory] save_context 실패: {e}")
 
-    # 2) FACTS 엔티티 추출 및 병합
+    # 2) FACTS 추출 → 기존 요약과 병합 → 메모리에 저장
     prev_summary = get_summary_text()
-    print(f"prev_summary : {prev_summary}")
-    if prev_summary:
-      print(f"[SUMMARY] prev(head): {prev_summary[:200]}{'...' if len(prev_summary)>200 else ''}")
 
-    ents = extract_entities_for_summary(user_text, assistant_text)
-
-    # 🔥 payload에서 target_time 보강 (있을 때만)
-    if payload:
-        tt = (payload.get("target_time") or {})
-        y = (tt.get("year") or {}).get("ganji")
-        m = (tt.get("month") or {}).get("ganji")
-        d = (tt.get("day") or {}).get("ganji")
-        h = (tt.get("hour") or {}).get("ganji")
-
-        for g in [y, m, d, h]:
-            if g and g not in ents["간지"]:
-                ents["간지"].append(g)
-        if y and y not in ents["타겟_연도"]:
-            ents["타겟_연도"].append(y)
-        if m and m not in ents["타겟_월"]:
-            ents["타겟_월"].append(m)
-        if d and d not in ents.get("타겟_일", []):
-            ents.setdefault("타겟_일", []).append(d)
-        if h and h not in ents.get("타겟_시", []):
-            ents.setdefault("타겟_시", []).append(h)
-
+    ents = extract_entities_for_summary(user_text, assistant_text, payload=payload)   # ← 당신이 이미 만든 함수
     new_summary = enrich_summary_with_entities(prev_summary, ents, keep_tail_chars=1200)
-    
-    # 5) 요약 저장
     set_summary_text(new_summary)
 
-    # 6) 라운드트립 검증: 저장 후 다시 읽어와 비교
-    roundtrip = get_summary_text()
-    print(f"[SUMMARY] roundtrip length={len(roundtrip)}")
-    print(f"[SUMMARY] roundtrip(head): {roundtrip[:200]}{'...' if len(roundtrip)>200 else ''}")
-
-    # 7) 최종 상태 요약
-    try:
-        print("\n🧠 현재 global_memory.moving_summary_buffer (요약) 내용:")
-        print(f"메모리 내 메시지 수: {len(global_memory.chat_memory.messages)}")
-        print(f"현재 토큰 수 (추정): {len(str(global_memory.chat_memory.messages)) // 4}")
-        print(f"요약 버퍼 내용: {global_memory.moving_summary_buffer}")
-    except Exception as e:
-        print(f"[MEM] status 출력 실패: {e}")
+    # 3) 상태 로그
+    print("\n🧠 현재 global_memory.moving_summary_buffer (요약) 내용:")
+    print(f"메모리 내 메시지 수: {len(global_memory.chat_memory.messages)}")
+    print(f"현재 토큰 수 (추정): {len(str(global_memory.chat_memory.messages)) // 4}")
+    print(f"요약 버퍼 내용:\n{get_summary_text()}")
 
     print("================== record_turn end ==================\n")
 
@@ -836,33 +795,23 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         print(f"질문 : {updated_question}")
 
         # ✅ 요약 텍스트 가져오기 (이미 쓰는 전역 메모리 그대로)
-        summary_text = global_memory.moving_summary_buffer or ""
+        #summary_text = global_memory.moving_summary_buffer or ""
+        summary_text = get_summary_text()
 
-        # ✅ 저장된 FACTS에서 즉시 조회 시도 (면접/결혼/여행/생일의 '언제/날짜/기억' 류 질문)
-        # maybe_lookup = quick_lookup_from_facts(updated_question, summary_text)
-        # if maybe_lookup:
-        #     # 대화/요약에도 기록
-        #     record_turn(updated_question, maybe_lookup)
-        #     return https_fn.Response(
-        #         response=json.dumps({"answer": maybe_lookup}, ensure_ascii=False),
-        #         status=200,
-        #         headers={"Content-Type": "application/json; charset=utf-8"}
-        #     )
+        #✅ 저장된 FACTS에서 즉시 조회 시도 (면접/결혼/여행/생일의 '언제/날짜/기억' 류 질문)
+        maybe_lookup = quick_lookup_from_facts(updated_question, summary_text)
+        if maybe_lookup:
+            # 대화/요약에도 기록
+            record_turn(updated_question, maybe_lookup)
+            return https_fn.Response(
+                response=json.dumps({"answer": maybe_lookup}, ensure_ascii=False),
+                status=200,
+                headers={"Content-Type": "application/json; charset=utf-8"}
+            )
 
         #1차 분류
         category = classify_question(updated_question)
         print(f"📂 최종 분류 결과: {category}")
-
-        # 유효 카테고리인지 확인
-        # if category not in valid_categories:
-        #     korean_label = category_to_korean.get(category, "알 수 없는 카테고리")
-        #     return https_fn.Response(
-        #         response=json.dumps({
-        #             "answer": f"이 질문은 '{korean_label}' 카테고리에 속하며, 사주/점괘 응답 대상이 아닙니다."
-        #         }, ensure_ascii=False),
-        #         status=200,
-        #         headers={"Content-Type": "application/json; charset=utf-8"}
-        #     )
 
         # ──────────────────────────────── fortune(점괘) 분기 ────────────────────────────────
         #if category == "fortune":
@@ -1019,6 +968,10 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             #else:
             #    focus = category_to_focus.get(category, "종합운")  # 기본값은 종합운
 
+
+            # ── 사용자 페이로드 구성 (3인자 버전 권장) ─────────────────────────────
+            # make_saju_payload 시그니처가 4인자(absolute_keywords 포함)라면 여기에 absolute_keywords를 추가하거나,
+            # 정의부를 3인자 버전으로 단순화해줘.
             print(f"focus : {focus}")
             user_payload = make_saju_payload(data, focus, updated_question)
 
@@ -1030,7 +983,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 model="gpt-4o-mini",
                 max_tokens=500,
                 timeout=25,           # 25초 내 못 받으면 예외
-                max_retries=0,        # 재시도 안 함 (지연 방지)
+                max_retries=2,        # 재시도 안 함 (지연 방지)
             )
 
             chat_with_memory = RunnableWithMessageHistory(
@@ -1054,7 +1007,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             mode = parse_mode_tag(answer_text)
             print(f"🔖 MODE: {mode}")
             
-            record_turn(updated_question, result.content,)
+            record_turn(updated_question, result.content, payload=user_payload)
             #print_summary_state()
             # print("\n🧠 현재 global_memory.moving_summary_buffer (요약) 내용:")
             # print(f"메모리 내 메시지 수: {len(global_memory.chat_memory.messages)}")

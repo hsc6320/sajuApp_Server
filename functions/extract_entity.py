@@ -5,6 +5,9 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 import re
 
+
+FACT_KEYS = ["종목명","인물","타겟_연도","타겟_월","타겟_일","타겟_시","간지","키워드"]
+
 # ──────────────────────────────
 # 1) 유틸: 중복 제거
 def _dedup_list(items):
@@ -180,6 +183,9 @@ def _parse_facts_from_summary(summary: str) -> dict:
 # 6) summary에 FACTS 병합
 def enrich_summary_with_entities(prev_summary: str, new_entities: dict, keep_tail_chars: int = 1200) -> str:
     print("[FACTS] enrich start")
+    print("\n[FACTS] --- enrich_summary_with_entities 시작 ---")
+    print(f"[FACTS] 이전 summary 길이: {len(prev_summary) if prev_summary else 0}")
+    print(f"[FACTS] 신규 엔티티 입력: {json.dumps(new_entities, ensure_ascii=False)}")
     prev_summary = prev_summary or ""
     if FACTS_HEADER in prev_summary:
         prev_body = prev_summary.split(FACTS_HEADER, 1)[0].rstrip()
@@ -192,21 +198,73 @@ def enrich_summary_with_entities(prev_summary: str, new_entities: dict, keep_tai
         print(f"[FACTS] body trimmed to {keep_tail_chars} chars")
     old_facts = _parse_facts_from_summary(prev_summary)
     merged = _merge_entities(old_facts, new_entities)
+       # 🟡 디버깅 로그
+    print("===== FACTS Debug Log =====")
+    print(f"[FACTS] 신규 엔티티 입력: {new_entities}")
+    print(f"[FACTS] 기존 FACTS 파싱 결과: {old_facts}")
+    print(f"[FACTS] 병합된 FACTS 결과: {merged}")
+    print("============================")
+
     parts = [prev_body.strip(), "", _format_facts_block(merged)]
     result = "\n".join([p for p in parts if p is not None]).strip()
     print("[FACTS] enrich end")
     return result
 
-# ──────────────────────────────
-# 7) 엔티티 추출 (예시)
-def extract_entities_for_summary(user_text: str, assistant_text: str) -> dict:
-    ents = {k: [] for k in ["종목명","인물","타겟_연도","타겟_월","타겟_일","타겟_시","간지","키워드","이벤트"]}
-    if "면접" in user_text:
-        ents["이벤트"].append({"종류":"면접","날짜":"2025-09-15","설명":"을사년 갑신월 경오일 면접"})
-    if "아들" in user_text and "생일" in user_text:
-        ents["인물"].append("아들")
-        ents["이벤트"].append({"종류":"생일","날짜":"2026-03-14","설명":"아들 생일"})
+# ===== [D] extract_entities_for_summary 인자화, 안전화 =====
+def extract_entities_for_summary(user_text: str, assistant_text: str, payload: dict | None = None) -> dict:
+    print("\n[ENTITIES] --- extract_entities_for_summary 시작 ---")
+    print(f"[ENTITIES] 사용자 입력: {user_text}")
+    print(f"[ENTITIES] AI 응답: {assistant_text}")
+
+    ents = {k: [] for k in FACT_KEYS + ["이벤트"]}
+
+    # ✅ payload.target_time에서 간지 보강 (없으면 skip)
+    if payload:
+        tt = (payload.get("target_time") or {})
+        y = (tt.get("year")  or {}).get("ganji")
+        m = (tt.get("month") or {}).get("ganji")
+        d = (tt.get("day")   or {}).get("ganji")
+        h = (tt.get("hour")  or {}).get("ganji")
+
+        if y: ents["타겟_연도"].append(y); ents["간지"].append(y)
+        if m: ents["타겟_월"].append(m);   ents["간지"].append(m)
+        if d: ents["타겟_일"].append(d);   ents["간지"].append(d)
+        if h: ents["타겟_시"].append(h);   ents["간지"].append(h)
+
+    # TODO: 필요하다면 여기서 user_text/assistant_text에서
+    # 종목명/인물/키워드 간단 정규식 추출을 추가할 수 있음.
+
+    # 중복 제거 & 상한
+    for k in FACT_KEYS:
+        ents[k] = _dedup_list(ents.get(k, []))[:8]
+
+
+    print("[ENTITIES] --- extract_entities_for_summary 끝 ---\n")
     return ents
+
+
+# ===== [C] wanted 이벤트 종류 간단 추출기 =====
+# 질문에서 특정 이벤트 의도를 추출 (룰 기반 키워드 매칭)
+def _wanted_event_kind(text: str) -> str | None:
+    if not text:
+        return None
+    t = text.strip().lower()
+
+    # 우선순위가 겹칠 수 있으므로, 긴 키워드 먼저 체크
+    rules = [
+        # (키워드들, 정규화된 이벤트명)
+        (["면접", "인터뷰"], "면접"),
+        (["결혼식", "웨딩", "결혼"], "결혼"),
+        (["출장", "여행"], "여행"),
+        (["시험", "수능", "자격증", "고시"], "시험"),
+        (["생일", "생신", "birthday", "돌잔치", "돌"], "생일"),
+        (["기념일", "anniversary"], "기념일"),
+    ]
+    for keywords, kind in rules:
+        for kw in keywords:
+            if kw in t:
+                return kind
+    return None
 
 def quick_lookup_from_facts(question: str, summary_text: str) -> str | None:
     kind = _wanted_event_kind(question)             # 어떤 이벤트를 찾는지
