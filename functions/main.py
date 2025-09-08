@@ -732,8 +732,8 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         currDaewoonJi = data.get("currDaewoonJi","")
 
         result = ext_chain.run(question)
-        print(f"랭체인 키워드 분류")
-        print(result)
+        print("🔎 랭체인 키워드 분류", flush=True)
+        print(result, flush=True)
 
         print(f"🧑 이름: {user_name}, 🌿 간지: {sajuganji}, 📊 대운: {daewoon}, 현재: {current_daewoon}")
         print(f"십성정보 : 년간 {yearGan}/{yearJi} 월간{wolGan}/{wolJi} 대운{currDaewoonGan}/{currDaewoonJi}")
@@ -799,15 +799,15 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         summary_text = get_summary_text()
 
         #✅ 저장된 FACTS에서 즉시 조회 시도 (면접/결혼/여행/생일의 '언제/날짜/기억' 류 질문)
-        maybe_lookup = quick_lookup_from_facts(updated_question, summary_text)
-        if maybe_lookup:
-            # 대화/요약에도 기록
-            record_turn(updated_question, maybe_lookup)
-            return https_fn.Response(
-                response=json.dumps({"answer": maybe_lookup}, ensure_ascii=False),
-                status=200,
-                headers={"Content-Type": "application/json; charset=utf-8"}
-            )
+        # maybe_lookup = quick_lookup_from_facts(updated_question, summary_text)
+        # if maybe_lookup:
+        #     # 대화/요약에도 기록
+        #     record_turn(updated_question, maybe_lookup)
+        #     return https_fn.Response(
+        #         response=json.dumps({"answer": maybe_lookup}, ensure_ascii=False),
+        #         status=200,
+        #         headers={"Content-Type": "application/json; charset=utf-8"}
+        #     )
 
         #1차 분류
         category = classify_question(updated_question)
@@ -955,7 +955,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         # ───────────────── saju(사주) 분기 ─────────────────
         #elif category == "saju":
         else :
-            print("*******SAJU_COUNSEL_SYSTEM 분기")
+            print(f"*******SAJU_COUNSEL_SYSTEM 분기")
             summary_text = global_memory.moving_summary_buffer or ""
 
             # 기존 데이터에서 테스트용 스키마 구성 (target_time 값 있으면 채워서 전달)
