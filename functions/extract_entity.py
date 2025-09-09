@@ -457,16 +457,16 @@ def quick_lookup_from_facts(question: str, summary_text: str) -> str | None:
 # # 8) record_turn
 # global_summary = ""
 
-# def record_turn(user_text: str, assistant_text: str):
-#     global global_summary
-#     print("\n================= record_turn start =================")
-#     print(f"[TURN] user: {user_text}")
-#     print(f"[TURN] assistant: {assistant_text[:100]}{'...' if len(assistant_text)>100 else ''}")
-#     prev_summary = global_summary
-#     ents = extract_entities_for_summary(user_text, assistant_text)
-#     print(f"[TURN] ents={ents}")
-#     new_summary = enrich_summary_with_entities(prev_summary, ents, keep_tail_chars=1200)
-#     global_summary = new_summary
-#     print("[TURN] roundtrip summary head:")
-#     print(global_summary[:300])
-#     print("================== record_turn end ==================\n")
+def record_turn(user_text: str, assistant_text: str):
+    global global_summary
+    print("\n================= record_turn start =================")
+    print(f"[TURN] user: {user_text}")
+    print(f"[TURN] assistant: {assistant_text[:100]}{'...' if len(assistant_text)>100 else ''}")
+    prev_summary = global_summary
+    ents = extract_entities_for_summary(user_text, assistant_text)
+    print(f"[TURN] ents={ents}")
+    new_summary = enrich_summary_with_entities(prev_summary, ents, keep_tail_chars=1200)
+    global_summary = new_summary
+    print("[TURN] roundtrip summary head:")
+    print(global_summary[:300])
+    print("================== record_turn end ==================\n")

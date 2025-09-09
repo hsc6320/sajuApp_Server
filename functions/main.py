@@ -580,40 +580,12 @@ def record_turn(user_text: str, assistant_text: str, payload: dict | None = None
     print(f"[TURN] user: {user_text}")
     print(f"[TURN] assistant_text: {assistant_text}")
 
-    # 0) 기존 요약(= moving_summary_buffer)을 확보해둠 (이 안에 기존 FACTS가 있음)
-    prev_summary = get_summary_text()
-
     # 1) LangChain 대화 로그/요약 갱신 → LLM이 만든 '새 본문'을 얻기 위함
     try:
         global_memory.save_context({"input": user_text}, {"output": assistant_text})
         _ = global_memory.load_memory_variables({})
     except Exception as e:
         print(f"[memory] save_context 실패: {e}")
-
-    # 2) LLM이 방금 만든 최신 요약에서 '본문'만 추출 (FACTS는 버림)
-    after_text = get_summary_text()
-    new_body, _ = _split_body_and_facts(after_text)
-    
-    if not new_body:
-        # 혹시 비어있다면 이전 본문으로 폴백
-        new_body = (assistant_text or "").strip()
-
-    # 3) 이번 턴 엔티티 추출
-    ents = extract_entities_for_summary(user_text, assistant_text, payload=payload)
-
-    # 4) ✅ 기존 요약(prev_summary)에 신규 엔티티(ents)를 병합 → FACTS까지 일관 머지
-    merged_summary = enrich_summary_with_entities(prev_summary, ents, keep_tail_chars=1200)
-
-    # 5) merged_summary에서 FACTS 블록만 가져오고, 본문은 LLM의 최신 'new_body'로 교체
-    _, facts_block = _split_body_and_facts(merged_summary)
-    if not facts_block:
-        # 이론상 거의 없지만, FACTS 블록이 없다면 새로 만들어 붙임
-        facts_block = _format_facts_block(_parse_facts_from_summary(merged_summary))
-
-    final_summary = "\n\n".join([new_body, facts_block]).strip()
-
-    # 6) 최종 저장 (메모리만)
-    set_summary_text(final_summary)
 
     # (옵션) 상태 출력
     try:
@@ -860,16 +832,16 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         summary_text = get_summary_text()
 
         #✅ 저장된 FACTS에서 즉시 조회 시도 (면접/결혼/여행/생일의 '언제/날짜/기억' 류 질문)
-        maybe_lookup = quick_lookup_from_facts(updated_question, summary_text)
-        print(f"maybe_lookup : {maybe_lookup}")
-        if maybe_lookup:
-            # 대화/요약에도 기록
-            record_turn(updated_question, maybe_lookup)
-            return https_fn.Response(
-                response=json.dumps({"answer": maybe_lookup}, ensure_ascii=False),
-                status=200,
-                headers={"Content-Type": "application/json; charset=utf-8"}
-            )
+        # maybe_lookup = quick_lookup_from_facts(updated_question, summary_text)
+        # print(f"maybe_lookup : {maybe_lookup}")
+        # if maybe_lookup:
+        #     # 대화/요약에도 기록
+        #     record_turn(updated_question, maybe_lookup)
+        #     return https_fn.Response(
+        #         response=json.dumps({"answer": maybe_lookup}, ensure_ascii=False),
+        #         status=200,
+        #         headers={"Content-Type": "application/json; charset=utf-8"}
+        #     )
 
         #1차 분류
         category = classify_question(updated_question)
