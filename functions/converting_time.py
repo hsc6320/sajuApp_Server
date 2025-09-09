@@ -438,42 +438,51 @@ def sexagenary_of_gregorian_year(year: int, prefer_hanzi: bool = True) -> str:
 
 # def extract_target_ganji_v2(absolute_keywords: List[str], updated_question: str
 #                              ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-def extract_target_ganji_v2(
-    updated_question: str,
-    extra_tokens: Optional[List[str]] = None
-) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """
-    반환: (year, month, day, hour) — 모두 '甲申' 형태 (없으면 None)
-    1) 접미사 명시 매칭(년/월/일/시)
-    2) 연도 숫자(YYYY년) → 간지 변환
-    """
-   # sources = " ".join([*(absolute_keywords or []), updated_question or ""])
-    # sources 구성: 질문 + 추가 토큰
-    tokens = extra_tokens or []
-    # dict/리스트가 섞여 들어올 때를 대비해 문자열화
-    token_strs = [t if isinstance(t, str) else str(t) for t in tokens]
-    sources = " ".join([updated_question or "", *token_strs]).strip()
+# ── 간지 패턴: '甲申', '乙巳' 등
+GANJI_RX = r"[甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥]"
+YEAR_RX  = re.compile(rf"{GANJI_RX}\s*년")
+MONTH_RX = re.compile(rf"{GANJI_RX}\s*월")
+DAY_RX   = re.compile(rf"{GANJI_RX}\s*일")
+HOUR_RX  = re.compile(rf"{GANJI_RX}\s*시")
 
-    year = None
-    month = None
-    day = None
-    hour = None
+def normalize_ganji(s: str) -> str:
+    return re.search(GANJI_RX, s).group(0) if re.search(GANJI_RX, s) else None
 
-    # 1) 접미사 명시된 간지 우선
-    m = YEAR_RX.search(sources)
+def sexagenary_of_gregorian_year(y: int, prefer_hanzi=True) -> str:
+    # 연간지 변환기(간단 스텁). 실제 로직/테이블과 연결되어 있다면 그걸 호출하세요.
+    # 여기선 안전하게 None 반환 방지용으로 둡니다.
+    try:
+        stems = "甲乙丙丁戊己庚辛壬癸"
+        branches = "子丑寅卯辰巳午未申酉戌亥"
+        idx = (y - 4) % 60
+        return stems[idx % 10] + branches[idx % 12]
+    except:
+        return None
+
+def extract_target_ganji_v2(updated_question: str
+                             ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    updated_question(문자열)에서 타겟 연/월/일/시 간지 추출.
+    우선순위: 접미사 명시(년/월/일/시) → yyyy년 숫자→연간지.
+    """
+    src = updated_question or ""
+    year = month = day = hour = None
+
+    m = YEAR_RX.search(src)
     if m: year = normalize_ganji(m.group(0))
-    m = MONTH_RX.search(sources)
+    m = MONTH_RX.search(src)
     if m: month = normalize_ganji(m.group(0))
-    m = DAY_RX.search(sources)
+    m = DAY_RX.search(src)
     if m: day = normalize_ganji(m.group(0))
-    m = HOUR_RX.search(sources)
+    m = HOUR_RX.search(src)
     if m: hour = normalize_ganji(m.group(0))
 
-    # 2) 숫자 연도 → 간지 (연간지 미검출일 때만)
     if year is None:
-        ymatch = re.search(r"(\d{4})\s*(?:년|年)", sources)
+        ymatch = re.search(r"(\d{4})\s*(?:년|年)", src)
         if ymatch:
             y = int(ymatch.group(1))
-            year = sexagenary_of_gregorian_year(y, prefer_hanzi=True)  # 예: 2025 → 乙巳
-    print(f"extract_target_ganji_v2 {year} {month} {day} {hour}")
+            yg = sexagenary_of_gregorian_year(y, prefer_hanzi=True)
+            if yg: year = yg
+
     return year, month, day, hour
+

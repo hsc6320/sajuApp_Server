@@ -4,7 +4,7 @@ import os
 import json 
 from dotenv import load_dotenv
 from converting_time import extract_target_ganji_v2
-from extract_entity import extract_entities_for_summary, enrich_summary_with_entities, quick_lookup_from_facts
+from extract_entity import extract_entities_for_summary, enrich_summary_with_entities, quick_lookup_from_facts, _parse_facts_from_summary
 from sip_e_un_sung import unseong_for, branch_for, pillars_unseong, seun_unseong
 from converting_time import convert_relative_time
 from Sipsin import get_sipshin, get_ji_sipshin_only
@@ -366,7 +366,7 @@ base_chain = prompt | llm
 # 현재는 `global_memory`를 반환하므로, 어떤 session_id가 들어와도 동일한 메모리를 참조합니다.
 # 사용자 요구사항에 맞게 전역 메모리를 반환하도록 유지합니다.
 def get_session_history_func(session_id: str) -> ChatMessageHistory:
-    print(f"🔄 세션 '{session_id}'의 기록 가져오기 (전역 메모리 사용)")
+   # print(f"🔄 세션 '{session_id}'의 기록 가져오기 (전역 메모리 사용)")
     return global_memory.chat_memory
 
 print("✅ Chain 구성 완료")
@@ -486,8 +486,7 @@ def classify_question(question: str) -> str:
     #     return category
 
     # 2차: LLM 기반 분류
-    category = categoryDetail_chain.run(question).strip().lower()
-    print(f"🤖 LLM 기반 분류: {category}")
+    category = categoryDetail_chain.run(question).strip().lower()    
 
     # 안전장치: 예상 외 값이 나오면 'counsel'로 폴백
     if category not in ["saju", "fortune", "counsel"]:
@@ -524,44 +523,106 @@ schema = {
 }
 ext_chain = create_extraction_chain(schema=schema, llm=llm2)
 
+# ✅ 전용 FACTS 요약 슬롯: global_memory.facts_summary
 def get_summary_text() -> str:
-    """LangChain ConversationSummaryBufferMemory에 저장된 요약을 가져온다."""
     try:
         return getattr(global_memory, "moving_summary_buffer", "") or ""
     except Exception:
         return ""
 
 def set_summary_text(text: str) -> None:
-    """요약을 ConversationSummaryBufferMemory에 저장한다."""
+    """요약을 메모리에만 저장(교체)."""
+    safe = text or ""
     try:
-        # 1) LangChain 메모리의 요약 필드에 직접 반영
-        setattr(global_memory, "moving_summary_buffer", text or "")
-       # global_memory.moving_summary_buffer = text or ""
+        # ConversationSummaryBufferMemory가 가진 정식 필드만 사용
+        global_memory.moving_summary_buffer = safe
     except Exception as e:
-        print(f"[summary] set 실패: {e}")
+        print(f"[summary] moving_summary_buffer set 실패: {e}")
+    
+
+FACTS_HEADER = "📌 FACTS(엔티티):"    
+def _split_body_and_facts(text: str) -> tuple[str, str]:
+    """요약 문자열을 본문/FACTS 블록으로 분리."""
+    if not text:
+        return "", ""
+    idx = text.find(FACTS_HEADER)
+    if idx == -1:
+        return text.strip(), ""
+    return text[:idx].rstrip(), text[idx:].strip()
+
+def _format_facts_block(facts: dict) -> str:
+    print(f"[FACTS] formatting keys: {list(facts.keys())}")
+    facts = facts or {}
+    lines = [
+        FACTS_HEADER,
+        f"- 인물: {', '.join(facts.get('인물', [])) or '없음'}",
+        f"- 종목명: {', '.join(facts.get('종목명', [])) or '없음'}",
+        f"- 타겟_연도: {', '.join(facts.get('타겟_연도', [])) or '없음'}",
+        f"- 타겟_월: {', '.join(facts.get('타겟_월', [])) or '없음'}",
+        f"- 타겟_일: {', '.join(facts.get('타겟_일', [])) or '없음'}",
+        f"- 타겟_시: {', '.join(facts.get('타겟_시', [])) or '없음'}",
+        f"- 간지: {', '.join(facts.get('간지', [])) or '없음'}",
+        f"- 키워드: {', '.join(facts.get('키워드', [])) or '없음'}",
+        f"- 이벤트:"
+    ]
+    events = facts.get("이벤트", []) or []
+    if not events:
+        lines.append("  (없음)")
+    else:
+        for e in events:
+            lines.append(f"  - 종류: {e.get('종류','')}")
+            if e.get("날짜"):  lines.append(f"    날짜: {e['날짜']}")
+            if e.get("설명"):  lines.append(f"    설명: {e['설명']}")
+    return "\n".join(lines)
 
 def record_turn(user_text: str, assistant_text: str, payload: dict | None = None):
-    """대화 1턴 저장 + LangChain 요약 갱신 + FACTS 병합"""
+    print("\n================= record_turn start =================")
+    print(f"[TURN] user: {user_text}")
+    print(f"[TURN] assistant_text: {assistant_text}")
 
-    # 1) LangChain 메모리에 원문 저장(요약 자동 업데이트 트리거)
+    # 0) 기존 요약(= moving_summary_buffer)을 확보해둠 (이 안에 기존 FACTS가 있음)
+    prev_summary = get_summary_text()
+
+    # 1) LangChain 대화 로그/요약 갱신 → LLM이 만든 '새 본문'을 얻기 위함
     try:
         global_memory.save_context({"input": user_text}, {"output": assistant_text})
-        _ = global_memory.load_memory_variables({})   # 내부 요약 즉시 계산
+        _ = global_memory.load_memory_variables({})
     except Exception as e:
         print(f"[memory] save_context 실패: {e}")
 
-    # 2) FACTS 추출 → 기존 요약과 병합 → 메모리에 저장
-    prev_summary = get_summary_text()
+    # 2) LLM이 방금 만든 최신 요약에서 '본문'만 추출 (FACTS는 버림)
+    after_text = get_summary_text()
+    new_body, _ = _split_body_and_facts(after_text)
+    
+    if not new_body:
+        # 혹시 비어있다면 이전 본문으로 폴백
+        new_body = (assistant_text or "").strip()
 
-    ents = extract_entities_for_summary(user_text, assistant_text, payload=payload)   # ← 당신이 이미 만든 함수
-    new_summary = enrich_summary_with_entities(prev_summary, ents, keep_tail_chars=1200)
-    set_summary_text(new_summary)
+    # 3) 이번 턴 엔티티 추출
+    ents = extract_entities_for_summary(user_text, assistant_text, payload=payload)
 
-    # 3) 상태 로그
-    print("\n🧠 현재 global_memory.moving_summary_buffer (요약) 내용:")
-    print(f"메모리 내 메시지 수: {len(global_memory.chat_memory.messages)}")
-    print(f"현재 토큰 수 (추정): {len(str(global_memory.chat_memory.messages)) // 4}")
-    print(f"요약 버퍼 내용:\n{get_summary_text()}")
+    # 4) ✅ 기존 요약(prev_summary)에 신규 엔티티(ents)를 병합 → FACTS까지 일관 머지
+    merged_summary = enrich_summary_with_entities(prev_summary, ents, keep_tail_chars=1200)
+
+    # 5) merged_summary에서 FACTS 블록만 가져오고, 본문은 LLM의 최신 'new_body'로 교체
+    _, facts_block = _split_body_and_facts(merged_summary)
+    if not facts_block:
+        # 이론상 거의 없지만, FACTS 블록이 없다면 새로 만들어 붙임
+        facts_block = _format_facts_block(_parse_facts_from_summary(merged_summary))
+
+    final_summary = "\n\n".join([new_body, facts_block]).strip()
+
+    # 6) 최종 저장 (메모리만)
+    set_summary_text(final_summary)
+
+    # (옵션) 상태 출력
+    try:
+        print("\n🧠 현재 global_memory.moving_summary_buffer (요약) 내용:")
+        print(f"메모리 내 메시지 수: {len(global_memory.chat_memory.messages)}")
+        print(f"현재 토큰 수 (추정): {len(str(global_memory.chat_memory.messages)) // 4}")
+        print(f"요약 버퍼 내용:\n{get_summary_text()}")
+    except Exception:
+        pass
 
     print("================== record_turn end ==================\n")
 
@@ -799,15 +860,16 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         summary_text = get_summary_text()
 
         #✅ 저장된 FACTS에서 즉시 조회 시도 (면접/결혼/여행/생일의 '언제/날짜/기억' 류 질문)
-        # maybe_lookup = quick_lookup_from_facts(updated_question, summary_text)
-        # if maybe_lookup:
-        #     # 대화/요약에도 기록
-        #     record_turn(updated_question, maybe_lookup)
-        #     return https_fn.Response(
-        #         response=json.dumps({"answer": maybe_lookup}, ensure_ascii=False),
-        #         status=200,
-        #         headers={"Content-Type": "application/json; charset=utf-8"}
-        #     )
+        maybe_lookup = quick_lookup_from_facts(updated_question, summary_text)
+        print(f"maybe_lookup : {maybe_lookup}")
+        if maybe_lookup:
+            # 대화/요약에도 기록
+            record_turn(updated_question, maybe_lookup)
+            return https_fn.Response(
+                response=json.dumps({"answer": maybe_lookup}, ensure_ascii=False),
+                status=200,
+                headers={"Content-Type": "application/json; charset=utf-8"}
+            )
 
         #1차 분류
         category = classify_question(updated_question)
@@ -970,9 +1032,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
 
 
             # ── 사용자 페이로드 구성 (3인자 버전 권장) ─────────────────────────────
-            # make_saju_payload 시그니처가 4인자(absolute_keywords 포함)라면 여기에 absolute_keywords를 추가하거나,
-            # 정의부를 3인자 버전으로 단순화해줘.
-            print(f"focus : {focus}")
+            # make_saju_payload 시그니처가 4인자(absolute_keywords 포함)라면 여기에 absolute_keywords를 추가하거나,           
             user_payload = make_saju_payload(data, focus, updated_question)
 
             #chain = saju_prompt | ChatOpenAI(
@@ -993,9 +1053,10 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 history_messages_key="history",
             )
 
+
             result = chat_with_memory.invoke(
                 {
-                    "user_payload": json.dumps(user_payload, ensure_ascii=False),
+                   # "user_payload": json.dumps(user_payload, ensure_ascii=False),
                     "payload": json.dumps(user_payload, ensure_ascii=False),
                     "question": updated_question,
                     "summary": summary_text,
@@ -1005,16 +1066,22 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             )
             answer_text = getattr(result, "content", str(result))
             mode = parse_mode_tag(answer_text)
-            print(f"🔖 MODE: {mode}")
+            #print(f"result: {result}") openAI 응답 출력
             
+            # maybe_lookup = quick_lookup_from_facts(updated_question, summary_text)
+            # print(f"maybe_lookup : {maybe_lookup}")
+            # if maybe_lookup:
+            #     # 대화/요약에도 기록
+            #     record_turn(updated_question, maybe_lookup)
+            #     return https_fn.Response(
+            #         response=json.dumps({"answer": maybe_lookup}, ensure_ascii=False),
+            #         status=200,
+            #         headers={"Content-Type": "application/json; charset=utf-8"}
+            #     )   
+            
+            
+
             record_turn(updated_question, result.content, payload=user_payload)
-            #print_summary_state()
-            # print("\n🧠 현재 global_memory.moving_summary_buffer (요약) 내용:")
-            # print(f"메모리 내 메시지 수: {len(global_memory.chat_memory.messages)}")
-            # print(f"현재 토큰 수 (추정): {len(str(global_memory.chat_memory.messages)) // 4}")  # 대략적인 토큰 수 추정
-            # print(f"요약 버퍼 내용: {global_memory.moving_summary_buffer}")
-
-
             return https_fn.Response(
                 response=json.dumps({"answer": result.content}, ensure_ascii=False),
                 status=200,
