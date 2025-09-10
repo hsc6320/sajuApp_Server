@@ -6,7 +6,11 @@ firebase-admin
 flask
 
 # LangChain 패키지 및 버전 고정
-langchain==0.1.9
-langchain-core==0.1.27
-langchain-openai==0.0.8
-langchain-community==0.0.21
+#langchain==0.1.9
+#langchain-openai==0.0.8
+#langchain-community==0.0.21
+langchain-core>=0.2.22
+
+langchain>=0.2.10
+langchain-community>=0.2.10
+langchain-openai>=0.1.0

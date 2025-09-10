@@ -1,10 +1,12 @@
+from curses import meta
 from datetime import datetime
 import logging
 import os
 import json 
 from dotenv import load_dotenv
+from chat_json_store import ensure_session, record_turn_message
 from converting_time import extract_target_ganji_v2
-from extract_entity import extract_entities_for_summary, enrich_summary_with_entities, quick_lookup_from_facts, _parse_facts_from_summary
+from regress_chat import build_question_with_regression_context
 from sip_e_un_sung import unseong_for, branch_for, pillars_unseong, seun_unseong
 from converting_time import convert_relative_time
 from Sipsin import get_sipshin, get_ji_sipshin_only
@@ -99,6 +101,126 @@ from langchain.memory import ConversationSummaryBufferMemory, ChatMessageHistory
 from langchain_openai import ChatOpenAI
 from langchain.chains import LLMChain
 
+# 3. Prompt 정의 (수정 필요!)
+# SystemMessage에서는 이제 current_summary를 직접 넣지 않습니다.
+# MessagesPlaceholder("history")가 요약된 기록을 포함하여 제공할 것입니다.
+# base_system_prompt_template = """
+
+# 너는 사주명리학과 초씨역림에 정통한 지혜로운 조언가다.
+# 말투는 부드럽고 현실감 있게, 사람처럼 감정을 담아 표현해. (GPT스러움 금지)
+
+# [역할 분류 규칙]
+# 1. 질문이 모호/단순(“운세 봐줘”, “올해 어때?”) → 제공된 사주 정보만 활용
+#    - 절대 새로운 간지/대운/세운 계산 금지
+# 2. 말투는 따뜻한 친구처럼. 형식적/전문용어 남발 금지.
+
+# [금지 규칙]
+# - {user_name}, {sajuganji}, {daewoon}, {current_daewoon} 등의 새로운 간지/대운 생성 금지
+# - 내부 추론으로 재해석·변경 금지
+
+# [사주 데이터]
+# - 이름: {user_name}
+# - 간지: {sajuganji}
+# - 대운 흐름: {daewoon}
+# - 현재 대운: {current_daewoon}
+
+# ▶ 십성 판단 참고 정보:
+# - 음양: {yinYang}
+# - 기준 오행: {fiveElement}
+# - 년간: {yearGan}
+# - 년지: {yearJi}
+# - 월간: {wolGan}
+# - 월지: {wolJi}
+# - 일간: {ilGan}
+# - 일지: {ilJi}
+# - 시간: {siGan}
+# - 시지: {siJi}
+# - 현재 대운 천간: {currDaewoonGan}
+# - 현재 대운 지지: {currDaewoonJi}
+
+# [십성 해석 원칙]
+# - 반드시 일간(日干)을 중심으로 분류
+# - 주제(재물, 연애, 직업, 인간관계, 성향)에 맞는 십신을 우선
+# - 부족/중첩 → 강약·흐름·조화로 보정
+
+# [출력 형식]
+# ▶ 사주 해석:
+# - 사주 요약: 질문자 사주 구조 요약
+# - 대운 흐름: 제공된 대운 기반 요약
+# - 해석: 질문 관련 십신 중심 분석
+# - 조언: 실질적 제안/긍정적 메시지
+
+# 대화 요약:
+# {summary}
+
+# """
+# # [비견] 나와 성향이 같은 존재 → 주체성, 독립성  
+# # [겁재] 나와 비슷하나 음양이 다른 → 경쟁, 자존심, 손재수  
+# # [식신] 내가 생하는 기운 (동일 음양) → 표현력, 창의성, 자녀  
+# # [상관] 내가 생하는 기운 (다른 음양) → 직설적, 재능, 저항  
+# # [정재/편재] 내가 극하는 오행 → 소유, 재물, 현실, 수입  
+# # [정관/칠살] 나를 극하는 오행 → 사회적 책임, 직업, 긴장감  
+# # [정인/편인] 나를 생하는 오행 → 보호, 안정, 지식, 귀인
+# prompt = ChatPromptTemplate.from_messages([
+#     SystemMessage(content=base_system_prompt_template), # 여기에 포맷팅할 변수 포함
+#     MessagesPlaceholder(variable_name="history"), # 여기에 대화 기록 (요약 포함)이 들어옵니다.
+#     ("human", "{question}")
+# ])
+# base_chain = prompt | llm
+
+
+# def build_prompt(
+#     user_name,
+#     sajuganji,
+#     daewoon,
+#     current_daewoon,
+#     summary,
+
+#     # 십성 관련 파라미터
+#     yinYang,
+#     fiveElement,
+
+#     # 간지들
+#     yearGan, yearJi,
+#     wolGan, wolJi,
+#     ilGan, ilJi,
+#     siGan, siJi,
+
+#     # 대운 간지
+#     currDaewoonGan, currDaewoonJi,
+# ):
+#     filled_system_prompt = base_system_prompt_template.format(
+#         user_name=user_name,
+#         sajuganji=sajuganji,
+#         daewoon=daewoon,
+#         current_daewoon=current_daewoon,
+#         summary=summary,
+
+#         # 십성
+#         yinYang=yinYang,
+#         fiveElement=fiveElement,
+
+#         # 간지
+#         yearGan=yearGan,
+#         yearJi=yearJi,
+#         wolGan=wolGan,
+#         wolJi=wolJi,
+#         ilGan=ilGan,
+#         ilJi=ilJi,
+#         siGan=siGan,
+#         siJi=siJi,
+
+#         # 현재 대운 간지
+#         currDaewoonGan=currDaewoonGan,
+#         currDaewoonJi=currDaewoonJi,
+#     )
+
+#     return ChatPromptTemplate.from_messages([
+#         SystemMessage(content=filled_system_prompt),
+#         MessagesPlaceholder(variable_name="history"),
+#         ("human", "{question}")
+#     ])
+
 # 1. Load API Key
 load_dotenv()
 openai_key = os.getenv("OPENAI_API_KEY")
@@ -108,10 +230,12 @@ print("✅ OPENAI_API_KEY 로드 완료")
 # 2. LLM 정의  (사주 + 점괘 응답용)
 llm = ChatOpenAI(
     temperature=0.7,
-    top_p=1.0,
+    model_kwargs={"top_p": 1.0},  # ✅ 이렇게
     openai_api_key=openai_key,
-    model= "gpt-4o-mini" #"gpt-3.5-turbo" 
-)
+    model="gpt-4o-mini",
+    timeout=25,
+    max_retries=2,
+)#"gpt-3.5-turbo" 
 print("✅ LLM 초기화 완료")
 
 # 3. Memory 저장소 (글로벌 메모리 사용)
@@ -126,66 +250,6 @@ global_memory = ConversationSummaryBufferMemory(
 )
 print("✅ Memory 설정 완료")
 
-# 3. Prompt 정의 (수정 필요!)
-# SystemMessage에서는 이제 current_summary를 직접 넣지 않습니다.
-# MessagesPlaceholder("history")가 요약된 기록을 포함하여 제공할 것입니다.
-base_system_prompt_template = """
-
-너는 사주명리학과 초씨역림에 정통한 지혜로운 조언가다.
-말투는 부드럽고 현실감 있게, 사람처럼 감정을 담아 표현해. (GPT스러움 금지)
-
-[역할 분류 규칙]
-1. 질문이 모호/단순(“운세 봐줘”, “올해 어때?”) → 제공된 사주 정보만 활용
-   - 절대 새로운 간지/대운/세운 계산 금지
-2. 말투는 따뜻한 친구처럼. 형식적/전문용어 남발 금지.
-
-[금지 규칙]
-- {user_name}, {sajuganji}, {daewoon}, {current_daewoon} 등의 새로운 간지/대운 생성 금지
-- 내부 추론으로 재해석·변경 금지
-
-[사주 데이터]
-- 이름: {user_name}
-- 간지: {sajuganji}
-- 대운 흐름: {daewoon}
-- 현재 대운: {current_daewoon}
-
-▶ 십성 판단 참고 정보:
-- 음양: {yinYang}
-- 기준 오행: {fiveElement}
-- 년간: {yearGan}
-- 년지: {yearJi}
-- 월간: {wolGan}
-- 월지: {wolJi}
-- 일간: {ilGan}
-- 일지: {ilJi}
-- 시간: {siGan}
-- 시지: {siJi}
-- 현재 대운 천간: {currDaewoonGan}
-- 현재 대운 지지: {currDaewoonJi}
-
-[십성 해석 원칙]
-- 반드시 일간(日干)을 중심으로 분류
-- 주제(재물, 연애, 직업, 인간관계, 성향)에 맞는 십신을 우선
-- 부족/중첩 → 강약·흐름·조화로 보정
-
-[출력 형식]
-▶ 사주 해석:
-- 사주 요약: 질문자 사주 구조 요약
-- 대운 흐름: 제공된 대운 기반 요약
-- 해석: 질문 관련 십신 중심 분석
-- 조언: 실질적 제안/긍정적 메시지
-
-대화 요약:
-{summary}
-
-"""
-# [비견] 나와 성향이 같은 존재 → 주체성, 독립성  
-# [겁재] 나와 비슷하나 음양이 다른 → 경쟁, 자존심, 손재수  
-# [식신] 내가 생하는 기운 (동일 음양) → 표현력, 창의성, 자녀  
-# [상관] 내가 생하는 기운 (다른 음양) → 직설적, 재능, 저항  
-# [정재/편재] 내가 극하는 오행 → 소유, 재물, 현실, 수입  
-# [정관/칠살] 나를 극하는 오행 → 사회적 책임, 직업, 긴장감  
-# [정인/편인] 나를 생하는 오행 → 보호, 안정, 지식, 귀인
 # ✅ fortune 전용 프롬프트
 
 DEV_MSG = """
@@ -287,67 +351,9 @@ counseling_prompt = ChatPromptTemplate.from_messages([
     ("human", "JSON:\n{payload}\n\n질문: {question}")
 ])
 
-def build_prompt(
-    user_name,
-    sajuganji,
-    daewoon,
-    current_daewoon,
-    summary,
-
-    # 십성 관련 파라미터
-    yinYang,
-    fiveElement,
-
-    # 간지들
-    yearGan, yearJi,
-    wolGan, wolJi,
-    ilGan, ilJi,
-    siGan, siJi,
-
-    # 대운 간지
-    currDaewoonGan, currDaewoonJi,
-):
-    filled_system_prompt = base_system_prompt_template.format(
-        user_name=user_name,
-        sajuganji=sajuganji,
-        daewoon=daewoon,
-        current_daewoon=current_daewoon,
-        summary=summary,
-
-        # 십성
-        yinYang=yinYang,
-        fiveElement=fiveElement,
-
-        # 간지
-        yearGan=yearGan,
-        yearJi=yearJi,
-        wolGan=wolGan,
-        wolJi=wolJi,
-        ilGan=ilGan,
-        ilJi=ilJi,
-        siGan=siGan,
-        siJi=siJi,
-
-        # 현재 대운 간지
-        currDaewoonGan=currDaewoonGan,
-        currDaewoonJi=currDaewoonJi,
-    )
-
-    return ChatPromptTemplate.from_messages([
-        SystemMessage(content=filled_system_prompt),
-        MessagesPlaceholder(variable_name="history"),
-        ("human", "{question}")
-    ])
 
 # prompt 정의 시, MessagesPlaceholder를 포함합니다.
 # 시스템 프롬프트는 템플릿 형태로 유지하고, 동적으로 input 값을 받아 format 합니다.
-prompt = ChatPromptTemplate.from_messages([
-    SystemMessage(content=base_system_prompt_template), # 여기에 포맷팅할 변수 포함
-    MessagesPlaceholder(variable_name="history"), # 여기에 대화 기록 (요약 포함)이 들어옵니다.
-    ("human", "{question}")
-])
-
-
 saju_prompt = ChatPromptTemplate.from_messages([
     SystemMessage(content=DEV_MSG),                     # = developer
     AIMessage(content=ASSISTANT_DEMO),                 # = assistant few-shot (범용)
@@ -357,10 +363,6 @@ saju_prompt = ChatPromptTemplate.from_messages([
 ])
 print("✅ Prompt 정의 완료")
 
-# 5. Runnable Chain 정의
-# base_chain 정의: 이 체인에서는 직접적으로 history를 주입하지 않습니다.
-# history는 RunnableWithMessageHistory가 알아서 관리하고, MessagesPlaceholder로 전달됩니다.
-base_chain = prompt | llm
 
 # 세션 ID에 따라 다른 ChatMessageHistory 객체를 반환하는 함수
 # 현재는 `global_memory`를 반환하므로, 어떤 session_id가 들어와도 동일한 메모리를 참조합니다.
@@ -417,30 +419,6 @@ category_to_focus = {
 }
 
 # 2. LLM 기반 카테고리 분류 프롬프트
-category_prompt = PromptTemplate(
-    input_variables=["question"],
-    template="""
-당신은 사용자의 질문을 주어진 카테고리 중 하나로 분류하는 AI입니다.
-
-다음 질문을 가장 적절한 영어 카테고리로 분류하세요.
-가능한 카테고리: ["saju", "fortune", "life_decision", "relationship", "self_reflection", "timing", "academic", "job", "career_change", "matching", "etc"]
-
-예시:
-Q: "올해 이직해도 될까요?"
-A: career_change
-
-Q: "요즘 너무 지쳐요"
-A: self_reflection
-
-Q: "제 사주 좀 봐주세요"
-A: saju
-
-질문: {question}
-카테고리 (영어로 한 단어만):
-""".strip()
-)
-category_chain = LLMChain(llm=llm, prompt=category_prompt)
-
 categoryDetail_prompt = PromptTemplate(
     input_variables=["question"],
     template="""
@@ -495,17 +473,6 @@ def classify_question(question: str) -> str:
 
     return category
 
-
-# def classify_question(question: str) -> str:
-#     category = keyword_category(question)
-#     if category:
-#         print(f"🔍 키워드 기반 분류: {category}")
-#         return category
-#     category = category_chain.run(question).strip().lower()
-#     print(f"🤖 LLM 기반 분류: {category}")
-#     return category
-
-
 llm2 = ChatOpenAI(temperature=0.2)
 schema = {
     "properties": {
@@ -540,65 +507,6 @@ def set_summary_text(text: str) -> None:
         print(f"[summary] moving_summary_buffer set 실패: {e}")
     
 
-FACTS_HEADER = "📌 FACTS(엔티티):"    
-def _split_body_and_facts(text: str) -> tuple[str, str]:
-    """요약 문자열을 본문/FACTS 블록으로 분리."""
-    if not text:
-        return "", ""
-    idx = text.find(FACTS_HEADER)
-    if idx == -1:
-        return text.strip(), ""
-    return text[:idx].rstrip(), text[idx:].strip()
-
-def _format_facts_block(facts: dict) -> str:
-    print(f"[FACTS] formatting keys: {list(facts.keys())}")
-    facts = facts or {}
-    lines = [
-        FACTS_HEADER,
-        f"- 인물: {', '.join(facts.get('인물', [])) or '없음'}",
-        f"- 종목명: {', '.join(facts.get('종목명', [])) or '없음'}",
-        f"- 타겟_연도: {', '.join(facts.get('타겟_연도', [])) or '없음'}",
-        f"- 타겟_월: {', '.join(facts.get('타겟_월', [])) or '없음'}",
-        f"- 타겟_일: {', '.join(facts.get('타겟_일', [])) or '없음'}",
-        f"- 타겟_시: {', '.join(facts.get('타겟_시', [])) or '없음'}",
-        f"- 간지: {', '.join(facts.get('간지', [])) or '없음'}",
-        f"- 키워드: {', '.join(facts.get('키워드', [])) or '없음'}",
-        f"- 이벤트:"
-    ]
-    events = facts.get("이벤트", []) or []
-    if not events:
-        lines.append("  (없음)")
-    else:
-        for e in events:
-            lines.append(f"  - 종류: {e.get('종류','')}")
-            if e.get("날짜"):  lines.append(f"    날짜: {e['날짜']}")
-            if e.get("설명"):  lines.append(f"    설명: {e['설명']}")
-    return "\n".join(lines)
-
-def record_turn(user_text: str, assistant_text: str, payload: dict | None = None):
-    print("\n================= record_turn start =================")
-    print(f"[TURN] user: {user_text}")
-    print(f"[TURN] assistant_text: {assistant_text}")
-
-    # 1) LangChain 대화 로그/요약 갱신 → LLM이 만든 '새 본문'을 얻기 위함
-    try:
-        global_memory.save_context({"input": user_text}, {"output": assistant_text})
-        _ = global_memory.load_memory_variables({})
-    except Exception as e:
-        print(f"[memory] save_context 실패: {e}")
-
-    # (옵션) 상태 출력
-    try:
-        print("\n🧠 현재 global_memory.moving_summary_buffer (요약) 내용:")
-        print(f"메모리 내 메시지 수: {len(global_memory.chat_memory.messages)}")
-        print(f"현재 토큰 수 (추정): {len(str(global_memory.chat_memory.messages)) // 4}")
-        print(f"요약 버퍼 내용:\n{get_summary_text()}")
-    except Exception:
-        pass
-
-    print("================== record_turn end ==================\n")
-
-
 def print_summary_state():
     """현재 요약/버퍼 상태를 한 번에 로그"""
     print("\n🧠 현재 global_memory.moving_summary_buffer (요약) 내용:")
@@ -606,69 +514,67 @@ def print_summary_state():
     print(f"현재 토큰 수 (추정): {len(str(global_memory.chat_memory.messages)) // 4}")
     print(f"요약 버퍼 내용: {global_memory.moving_summary_buffer}")
 
-# 점괘 키워드만 강하게 분리
-FORTUNE_KEYS = ["초씨역림", "주역", "점괘", "괘", "육효", "괘상", "점쳐", "점치"]
-
-def is_fortune_query(text: str) -> bool:
-    t = (text or "").strip()
-    return any(k in t for k in FORTUNE_KEYS)
-
-def parse_mode_tag(text: str) -> str:
-    # 첫 줄에서 [MODE: SAJU|COUNSEL|LOOKUP] 태그 추출
-    line = (text or "").splitlines()[0].strip()
-    if "[MODE:" in line and "]" in line:
-        tag = line.replace("[","").replace("]","").strip().split(":")[-1].strip().upper()
-        if tag in ("SAJU","COUNSEL","LOOKUP"):
-            return tag
-    return "UNKNOWN"
 
 
 def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
-    """요청 data에서 사주 관련 정보를 추출해 표준 스키마(JSON)로 변환"""
+    """
+    요청 data에서 사주 관련 정보를 추출해 표준 스키마(JSON)로 변환
+    - 입력: data(dict), focus(str), updated_question(str)
+    - 출력: payload(dict)
+    """
+    # 기본 정보 (기본값 안전화)
+    question   = data.get("question", "") or ""
+    user_name  = data.get("name", "") or ""
+    sajuganji  = data.get("sajuganji") or {}          # ❗ 기본값은 dict
+    daewoon    = data.get("daewoon", "") or ""
+    current_dw = data.get("currentDaewoon", "") or "" # 문자열/간지표현일 수 있음
+    session_id = data.get("session_id") or "single_global_session"  # 필요 시 요청에서 받기
 
-    # 기본 정보
-    question = data.get("question", "")
-    user_name = data.get("name", "")
-    sajuganji = data.get("sajuganji", "")
-    daewoon = data.get("daewoon", "")
-    current_daewoon = data.get("currentDaewoon", "")
-    session_id = "single_global_session"
+    # 사주 원국 기둥 (키가 없을 수 있으니 dict.get 사용)
+    year        = sajuganji.get("년주", "") or ""
+    month       = sajuganji.get("월주", "") or ""
+    day         = sajuganji.get("일주", "") or ""
+    pillar_hour = sajuganji.get("시주", "") or ""      # ❗ time 변수명 피함
 
-    # 사주 원국 기둥
-    year = sajuganji.get("년주", "")
-    month = sajuganji.get("월주", "")
-    day = sajuganji.get("일주", "")
-    time  = sajuganji.get("시주", "")
-    
-    # 십성 참고 정보
-    yinYang = data.get("yinYang", "")
-    fiveElement = data.get("fiveElement", "")
-    yearGan = data.get("yearGan", "")
-    yearJi = data.get("yearJi", "")
-    wolGan = data.get("wolGan", "")
-    wolJi = data.get("wolJi", "")
-    ilGan = data.get("ilGan", "")
-    ilJi = data.get("ilJi", "")
-    siGan = data.get("siGan", "")
-    siJi = data.get("siJi", "")
-    currDaewoonGan = data.get("currDaewoonGan", "")
-    currDaewoonJi = data.get("currDaewoonJi", "")
+    # 십성 참고 정보 (없을 수 있음)
+    yinYang        = data.get("yinYang", "") or ""
+    fiveElement    = data.get("fiveElement", "") or ""
+    yearGan        = data.get("yearGan", "") or ""
+    yearJi         = data.get("yearJi", "") or ""
+    wolGan         = data.get("wolGan", "") or ""
+    wolJi          = data.get("wolJi", "") or ""
+    ilGan          = data.get("ilGan", "") or ""
+    ilJi           = data.get("ilJi", "") or ""
+    siGan          = data.get("siGan", "") or ""
+    siJi           = data.get("siJi", "") or ""
+    currDwGan      = data.get("currDaewoonGan", "") or ""
+    currDwJi       = data.get("currDaewoonJi", "") or ""
 
-    # 질문에서 타겟 간지 추출
-    t_year_ganji, t_month_ganji, t_day_ganji, t_hour_ganji = extract_target_ganji_v2( updated_question)
-    print(f"🎯 target_year_ganji: {t_year_ganji}, target_month_ganji: {t_month_ganji}, target_day_ganji: {t_day_ganji}, target_hour_ganji: {t_hour_ganji}")
-    
-    # 요약/엔티티 단계에서 쉽게 이용할 수 있도록 표준화된 엔티티 블록을 추가
+    # 질문에서 타겟 간지 추출 (에러 가드)
+    try:
+        t_year_ganji, t_month_ganji, t_day_ganji, t_hour_ganji = extract_target_ganji_v2(updated_question)
+    except Exception as e:
+        print(f"[make_saju_payload] ⚠️ extract_target_ganji_v2 실패: {e}")
+        t_year_ganji = t_month_ganji = t_day_ganji = t_hour_ganji = None
+
+    print(
+        f"[make_saju_payload] 🎯 타겟 간지 → "
+        f"year={t_year_ganji}, month={t_month_ganji}, day={t_day_ganji}, hour={t_hour_ganji}"
+    )
+
+    # 요약/엔티티 단계에서 쉽게 이용하도록 표준화
     target_ganji_list = [g for g in [t_year_ganji, t_month_ganji, t_day_ganji, t_hour_ganji] if g]
 
+    # 현재 대운 보조 필드: 없으면 None
+    curr_dw_sipseong = f"{currDwGan}/{currDwJi}" if (currDwGan or currDwJi) else None
 
     # 최종 스키마 구성
     payload = {
         "saju": {
             "year": year,
             "month": month,
-            "day": day,   # 일주는 보통 일간/일지로 분리 저장, 필요 시 수정
-            "hour": time
+            "day": day,          # NOTE: 필요 시 일간/일지 분리 구조로 확장 가능
+            "hour": pillar_hour
         },
         "natal": {
             "sipseong_by_pillar": {
@@ -679,31 +585,15 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
             }
         },
         "current_daewoon": {
-            "ganji": current_daewoon,
-            "sipseong": f"{currDaewoonGan}/{currDaewoonJi}",
-            "sibi_unseong": None  # 필요하면 별도 계산 후 채움
+            "ganji": current_dw or None,         # 빈 문자열이면 None
+            "sipseong": curr_dw_sipseong,        # "간/지" 조합, 없으면 None
+            "sibi_unseong": None                 # TODO: 필요 시 계산 후 채움
         },
-        "target_time" : {
-            "year": {
-                "ganji": t_year_ganji,
-                "sipseong": None,        # 일간 기준 십성 계산해서 넣을 수 있음
-                "sibi_unseong": None     # 일간 기준 십이운성 계산해서 넣을 수 있음
-            },
-            "month": {
-                "ganji": t_month_ganji,
-                "sipseong": None,
-                "sibi_unseong": None
-            },
-            "day": {
-                "ganji": t_day_ganji,
-                "sipseong": None,
-                "sibi_unseong": None
-            },
-            "hour": {
-                "ganji": t_hour_ganji,
-                "sipseong": None,
-                "sibi_unseong": None
-            }
+        "target_time": {
+            "year":  {"ganji": t_year_ganji,  "sipseong": None, "sibi_unseong": None},
+            "month": {"ganji": t_month_ganji, "sipseong": None, "sibi_unseong": None},
+            "day":   {"ganji": t_day_ganji,   "sipseong": None, "sibi_unseong": None},
+            "hour":  {"ganji": t_hour_ganji,  "sipseong": None, "sibi_unseong": None},
         },
         "focus": focus,
         "meta": {
@@ -711,22 +601,24 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
             "daewoon": daewoon,
             "yinYang": yinYang,
             "fiveElement": fiveElement,
-            "session_id": session_id,
+            "session_id": session_id,           # 필요 시 상위에서 실제 세션 주입
             "question": question,
-             # 🔥 요약 엔진에서 바로 읽어갈 수 있는 엔티티 블록
+            # 🔥 요약 엔진에서 바로 읽어갈 수 있는 엔티티 블록
             "entities": {
                 "간지": target_ganji_list,
                 "타겟_연도": t_year_ganji,
                 "타겟_월": t_month_ganji,
                 "타겟_일": t_day_ganji,
                 "타겟_시": t_hour_ganji,
-                "키워드": [],         # 필요 시 키워드 추출기에서 채움
-                "이벤트": []          # 필요 시 이벤트 추출기에서 채움
+                "키워드": [],     # 별도 키워드 추출기로 채울 예정이라면 유지
+                "이벤트": []
             }
         }
     }
 
+    print("[make_saju_payload] ✅ payload 구성 완료")
     return payload
+
 
 FORTUNE_KEYS = ["초씨역림", "주역", "점괘", "괘", "육효", "괘상", "점쳐", "점치"]
 
@@ -734,46 +626,61 @@ def is_fortune_query(text: str) -> bool:
     t = (text or "").strip()
     return any(k in t for k in FORTUNE_KEYS)
 
+# 🔎 "회귀 의도" 감지 (예: "다시", "지난번", "그때", "전에")
+def looks_like_regression(text: str) -> bool:
+    return any(kw in text for kw in ["다시", "지난번", "그때", "전에"])
+
 # 5. Firebase 함수 엔드포인트
 @https_fn.on_request(memory=2048, timeout_sec=60)
 def ask_saju(req: https_fn.Request) -> https_fn.Response:
     try:
         print("📥 요청 수신")
-        data = req.get_json()
+        data = req.get_json()       
+        # --- 안전한 입력 파싱 ---
+        question = (data.get("question") or "").strip()
+        user_name = data.get("name") or ""
+        sajuganji = data.get("sajuganji") or {}   # ✅ dict 기본값
+        daewoon = data.get("daewoon") or ""
+        current_daewoon = data.get("currentDaewoon") or ""
+        session_id = data.get("session_id") or "single_global_session"
 
-        question = data.get("question", "")
-        user_name = data.get("name", "")
-        sajuganji = data.get("sajuganji", "")
-        daewoon = data.get("daewoon", "")
-        current_daewoon = data.get("currentDaewoon", "")
-        session_id = "single_global_session"
+        # 사주 원국 기둥 (키 없을 수 있음)
+        year  = sajuganji.get("년주", "") or ""
+        month = sajuganji.get("월주", "") or ""
 
-        year = sajuganji.get("년주", "")
-        month = sajuganji.get("월주", "")
+        # 십성 참고
+        yinYang = data.get("yinYang", "") or ""
+        fiveElement = data.get("fiveElement", "") or ""
+        yearGan = data.get("yearGan", "") or ""
+        yearJi  = data.get("yearJi", "") or ""
+        wolGan  = data.get("wolGan", "") or ""
+        wolJi   = data.get("wolJi", "") or ""
+        ilGan   = data.get("ilGan", "") or ""
+        ilJi    = data.get("ilJi", "") or ""
+        siGan   = data.get("siGan", "") or ""
+        siJi    = data.get("siJi", "") or ""
+        currDaewoonGan = data.get("currDaewoonGan", "") or ""
+        currDaewoonJi  = data.get("currDaewoonJi", "")  or ""
 
-        yinYang= data.get("yinYang","")
-        fiveElement = data.get("fiveElement","")
-        yearGan = data.get("yearGan","")
-        yearJi = data.get("yearJi","")
-        wolGan = data.get("wolGan","")
-        wolJi = data.get("wolJi","")
-        ilGan = data.get("ilGan","")
-        ilJi = data.get("ilJi","")
-        siGan = data.get("siGan","")
-        siJi = data.get("siJi","")
-        currDaewoonGan = data.get("currDaewoonGan","")
-        currDaewoonJi = data.get("currDaewoonJi","")
-
+        question_for_llm = None       
+            
+        # --- 추출 체인 실행(버전 의존성 방어) ---
+        # try:
+        #     ext_result = ext_chain.invoke({"input": question})
+        # except Exception as e:
+        #     print(f"🔎 ext_chain.invoke 실패: {e}")
+        #     ext_result = {}
+            
         result = ext_chain.run(question)
-        print("🔎 랭체인 키워드 분류", flush=True)
-        print(result, flush=True)
+        print("🔎 랭체인 키워드 분류")
+        print(result)
 
         print(f"🧑 이름: {user_name}, 🌿 간지: {sajuganji}, 📊 대운: {daewoon}, 현재: {current_daewoon}")
         print(f"십성정보 : 년간 {yearGan}/{yearJi} 월간{wolGan}/{wolJi} 대운{currDaewoonGan}/{currDaewoonJi}")
         print(f"년주: {year} 월주: {month}")
         print(f"❓ 질문: {question}")
-        print(f"🔗 세션 ID: {session_id}") 
         
+        {
         # print("===========================테스트 코드 ===============================")
 
         # print(f"🧪 예시) 임수(壬) 일간에게 2025년 巳(사)는 어떤 운성?")
@@ -813,11 +720,13 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         # print(f"지지 기반 십신: {sipshin_Jiresult}")  # 결과: 편인 (예시)
 
         # print("===============================================================")
-
+        }
          # 현재 연도/월 기준으로 변환
+        
         current_year = datetime.now().year
         current_month = datetime.now().month
         current_day = datetime.now().day
+        print(f"오늘 날짜 : {current_year} : {current_month} : {current_day}")
 
         # 상대적 시간표현 → 절대표현으로 변환
         absolute_keywords, updated_question = convert_relative_time(question, result, current_year, current_month, current_day)
@@ -826,22 +735,17 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         print(f"🟡 갱신된 질문: {updated_question}")
 
         print(f"질문 : {updated_question}")
+        
 
         # ✅ 요약 텍스트 가져오기 (이미 쓰는 전역 메모리 그대로)
         #summary_text = global_memory.moving_summary_buffer or ""
         summary_text = get_summary_text()
-
-        #✅ 저장된 FACTS에서 즉시 조회 시도 (면접/결혼/여행/생일의 '언제/날짜/기억' 류 질문)
-        # maybe_lookup = quick_lookup_from_facts(updated_question, summary_text)
-        # print(f"maybe_lookup : {maybe_lookup}")
-        # if maybe_lookup:
-        #     # 대화/요약에도 기록
-        #     record_turn(updated_question, maybe_lookup)
-        #     return https_fn.Response(
-        #         response=json.dumps({"answer": maybe_lookup}, ensure_ascii=False),
-        #         status=200,
-        #         headers={"Content-Type": "application/json; charset=utf-8"}
-        #     )
+        
+        
+        # --- 회귀(이전 대화 회수) ---
+        # ✅ 회귀 판단 + 맥락 결합 (키워드 리스트 따로 만들 필요 없음)
+        question_for_llm, reg_dbg = build_question_with_regression_context(question=updated_question, summary_text=summary_text)
+        #print(f"[REG] 최종 회귀 상태: {reg_dbg}")
 
         #1차 분류
         category = classify_question(updated_question)
@@ -996,12 +900,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             # 병오/기축 테스트가 필요한 경우, req JSON에 아래 키들을 함께 넣어보면 됨:
             # target_year_ganji, target_year_sipseong, target_year_unseong,
             # target_month_ganji, target_month_sipseong, target_month_unseong
-            focus = data.get("focus") 
-            #if "focus" in data and data["focus"]:
-            #     focus = data["focus"]
-            #else:
-            #    focus = category_to_focus.get(category, "종합운")  # 기본값은 종합운
-
+            focus = data.get("focus") or "종합운"
 
             # ── 사용자 페이로드 구성 (3인자 버전 권장) ─────────────────────────────
             # make_saju_payload 시그니처가 4인자(absolute_keywords 포함)라면 여기에 absolute_keywords를 추가하거나,           
@@ -1024,36 +923,45 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 input_messages_key="question",
                 history_messages_key="history",
             )
-
+             # [중요] 대화 저장: 세션 보장
+            session_id = ensure_session(session_id, title="사주 대화")
+            
+            # [중요] 사용자 메시지 기록(+메타 자동추출)
+            record_turn_message(
+                session_id=session_id,
+                role="user",
+                text=question,
+                mode="GEN",
+                auto_meta=True,
+                extra_meta={
+                    # 간지 결과 등 추가 필드가 있다면 여기에 붙이세요(없으면 생략)
+                    # "ganji": {"year": "...", "month": "...", "day": "...", "hour": "..."}
+                },
+            )
 
             result = chat_with_memory.invoke(
                 {
                    # "user_payload": json.dumps(user_payload, ensure_ascii=False),
                     "payload": json.dumps(user_payload, ensure_ascii=False),
-                    "question": updated_question,
+                    "question": question_for_llm, #updated_question,
                     "summary": summary_text,
                     #"history": []  # history는 RunnableWithMessageHistory가 주입
                 },
                 config={"configurable": {"session_id": session_id}},
             )
             answer_text = getattr(result, "content", str(result))
-            mode = parse_mode_tag(answer_text)
             #print(f"result: {result}") openAI 응답 출력
             
-            # maybe_lookup = quick_lookup_from_facts(updated_question, summary_text)
-            # print(f"maybe_lookup : {maybe_lookup}")
-            # if maybe_lookup:
-            #     # 대화/요약에도 기록
-            #     record_turn(updated_question, maybe_lookup)
-            #     return https_fn.Response(
-            #         response=json.dumps({"answer": maybe_lookup}, ensure_ascii=False),
-            #         status=200,
-            #         headers={"Content-Type": "application/json; charset=utf-8"}
-            #     )   
             
+            # [중요] 어시스턴트 메시지 기록(메타 추출 불필요)
+            record_turn_message(
+                session_id=session_id,
+                role="assistant",
+                text=answer_text,
+                mode="SAJU",
+                auto_meta=False,
+            )
             
-
-            record_turn(updated_question, result.content, payload=user_payload)
             return https_fn.Response(
                 response=json.dumps({"answer": result.content}, ensure_ascii=False),
                 status=200,
