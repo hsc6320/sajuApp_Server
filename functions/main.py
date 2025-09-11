@@ -100,6 +100,8 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain.memory import ConversationSummaryBufferMemory, ChatMessageHistory
 from langchain_openai import ChatOpenAI
 from langchain.chains import LLMChain
+from google.cloud import storage
+
 
 # 3. Prompt 정의 (수정 필요!)
 # SystemMessage에서는 이제 current_summary를 직접 넣지 않습니다.
@@ -499,6 +501,7 @@ def get_summary_text() -> str:
 
 def set_summary_text(text: str) -> None:
     """요약을 메모리에만 저장(교체)."""
+    
     safe = text or ""
     try:
         # ConversationSummaryBufferMemory가 가진 정식 필드만 사용
@@ -511,10 +514,25 @@ def print_summary_state():
     """현재 요약/버퍼 상태를 한 번에 로그"""
     print("\n🧠 현재 global_memory.moving_summary_buffer (요약) 내용:")
     print(f"메모리 내 메시지 수: {len(global_memory.chat_memory.messages)}")
-    print(f"현재 토큰 수 (추정): {len(str(global_memory.chat_memory.messages)) // 4}")
+    #print(f"현재 토큰 수 (추정): {len(str(global_memory.chat_memory.messages)) // 4}")
     print(f"요약 버퍼 내용: {global_memory.moving_summary_buffer}")
 
+def record_turn(user_text: str, assistant_text: str, payload: dict | None = None): 
+    """대화 1턴 저장 + LangChain 요약 갱신 + FACTS 병합""" 
+    
+    #1) LangChain 메모리에 원문 저장(요약 자동 업데이트 트리거) 
+    try: 
+        global_memory.save_context({"input": user_text}, {"output": assistant_text}) 
+        _ = global_memory.load_memory_variables({}) 
+    except Exception as e: 
+        print(f"[memory] save_context 실패: {e}") 
 
+    # 3) 상태 로그 
+    print("\n🧠 현재 global_memory.moving_summary_buffer (요약) 내용:") 
+    print(f"메모리 내 메시지 수: {len(global_memory.chat_memory.messages)}") 
+    print(f"현재 토큰 수 (추정): {len(str(global_memory.chat_memory.messages)) // 4}") 
+    print(f"요약 버퍼 내용:\n{get_summary_text()}") 
+    print("================== record_turn end ==================\n")
 
 def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     """
@@ -734,9 +752,9 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         print(f"변환된 키워드: {absolute_keywords}")
         print(f"🟡 갱신된 질문: {updated_question}")
 
-        print(f"질문 : {updated_question}")
+        print(f"summary_text : {summary_text}")
         
-
+       
         # ✅ 요약 텍스트 가져오기 (이미 쓰는 전역 메모리 그대로)
         #summary_text = global_memory.moving_summary_buffer or ""
         summary_text = get_summary_text()
@@ -745,7 +763,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         # --- 회귀(이전 대화 회수) ---
         # ✅ 회귀 판단 + 맥락 결합 (키워드 리스트 따로 만들 필요 없음)
         question_for_llm, reg_dbg = build_question_with_regression_context(question=updated_question, summary_text=summary_text)
-        #print(f"[REG] 최종 회귀 상태: {reg_dbg}")
+        print(f"[REG] 최종 회귀 상태: {reg_dbg}")
 
         #1차 분류
         category = classify_question(updated_question)
@@ -908,7 +926,9 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
 
             #chain = saju_prompt | ChatOpenAI(
             chain = counseling_prompt | ChatOpenAI(
-                temperature=1.0, model_kwargs={"top_p": 0.9},
+                temperature=1.0, 
+                #model_kwargs={"top_p": 0.9},
+                top_p = 0.9,
                 openai_api_key=openai_key,
                 
                 model="gpt-4o-mini",
@@ -951,6 +971,9 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             )
             answer_text = getattr(result, "content", str(result))
             #print(f"result: {result}") openAI 응답 출력
+            
+            # 메모리 저장(옵션)
+            record_turn(updated_question, result.content, payload=user_payload)
             
             
             # [중요] 어시스턴트 메시지 기록(메타 추출 불필요)

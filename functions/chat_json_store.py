@@ -1,11 +1,49 @@
 # ===== JSON 대화저장 + 메타추출 (OpenAI + LangChain 0.2.x) =====
 import json, time, uuid, os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 from langchain_openai import ChatOpenAI
+
+
+
+# ───────── GCS 유틸 ─────────
+from google.cloud import storage
+
+def _is_gs_path(p: str) -> bool:
+    return isinstance(p, str) and p.startswith("gs://")
+
+def _parse_gs_path(gs_path: str) -> tuple[str, str]:
+    # gs://bucket/name/with/slashes.json -> (bucket, name/with/slashes.json)
+    no_scheme = gs_path[len("gs://"):]
+    parts = no_scheme.split("/", 1)
+    bucket = parts[0]
+    name = parts[1] if len(parts) > 1 else ""
+    #print(f"_parse_gs_path({str}, name : {name})")
+    return bucket, name
+
+
+def _gcs_read_text(gs_path: str) -> str:
+    bucket, name = _parse_gs_path(gs_path)
+    client = storage.Client()
+    bkt = client.bucket(bucket)
+    blob = bkt.blob(name)
+    if not blob.exists(client):
+        raise FileNotFoundError(gs_path)
+    return blob.download_as_text(encoding="utf-8")
+
+def _gcs_write_text(gs_path: str, text: str) -> None:
+    bucket, name = _parse_gs_path(gs_path)
+    client = storage.Client()
+    bkt = client.bucket(bucket)
+    blob = bkt.blob(name)
+    blob.cache_control = "no-store"
+    blob.content_type = "application/json"
+    blob.upload_from_string(text, content_type="application/json")
+    #print(f"[JSON-SAVE] GCS {gs_path} 저장 완료 (size={len(text)} bytes)")
 
 
 #CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,7 +71,8 @@ _EXTRACT_PROMPT = PromptTemplate(
     ),
 )
 
-def _get_extract_chain() -> LLMChain:
+#def _get_extract_chain() -> LLMChain:
+def _get_extract_chain():
     """추출 전용 LLMChain 초기화"""
     print(f"[CHAIN] 메타추출 체인 초기화: model={os.getenv('EXTRACT_MODEL','gpt-4o-mini')}, temp={os.getenv('EXTRACT_TEMPERATURE','0.0')}")
     llm_extract = ChatOpenAI(
@@ -41,9 +80,10 @@ def _get_extract_chain() -> LLMChain:
         temperature=float(os.environ.get("EXTRACT_TEMPERATURE", "0.0")),
         max_tokens=300,
         timeout=25,
-        # max_retries=2,  # 필요시
-    )
-    return LLMChain(llm=llm_extract, prompt=_EXTRACT_PROMPT)
+    )   
+      
+    #return LLMChain(llm=llm_extract, prompt=_EXTRACT_PROMPT)
+    return _EXTRACT_PROMPT | llm_extract
 
 _EXTRACT_CHAIN = _get_extract_chain()
 
@@ -51,7 +91,7 @@ _EXTRACT_CHAIN = _get_extract_chain()
 _CODEFENCE_RE = re.compile(r"```[a-zA-Z]*\s*([\s\S]*?)```", re.MULTILINE)
 
 def _to_text(raw: Any) -> str:
-    """LLM 응답이 dict/obj/str 무엇이든 사람이 읽을 수 있는 문자열로 변환"""
+    """LLM 응답을 문자열로 정규화"""
     if raw is None:
         return ""
     # langchain invoke/run의 결과가 객체이거나 dict 형태일 수 있음
@@ -59,8 +99,8 @@ def _to_text(raw: Any) -> str:
         return raw["text"]
     if hasattr(raw, "content") and isinstance(raw.content, str):
         return raw.content
-    if hasattr(raw, "text") and isinstance(raw.text, str):
-        return raw.text
+    if isinstance(raw, str):
+        return raw
     return str(raw)
 
 def _extract_json_block(raw_text: str) -> str:
@@ -81,7 +121,8 @@ def _safe_json_loads(maybe_json: str) -> Dict[str, Any]:
         return json.loads(maybe_json)
     except Exception:
         return {}
-    
+
+
 def _extract_meta(text: str) -> Dict[str, Any]:
     """
     OpenAI 모델을 사용해 JSON 메타를 추출한다.
@@ -89,11 +130,13 @@ def _extract_meta(text: str) -> Dict[str, Any]:
     OpenAI로 msg_keywords/target_date/time/kind/notes 추출 (invoke + 견고한 파싱)
     """
     print(f"[META] 입력 문장: {text}")
+    data = {}
+
     try:
         # run 또는 invoke 어떤 걸 쓰더라도 _to_text로 정규화
-        res = _EXTRACT_CHAIN.run(text=text)  # ← 지금 run을 쓰는게 target 계산 OK라면 유지
+        res = _EXTRACT_CHAIN.invoke({"text": text})
         raw = _to_text(res)
-        print(f"[META] 원시 응답: {raw}")
+        #print(f"[META] 원시 응답: {raw}")  //사용자 질문
         payload = _extract_json_block(raw)
         data = _safe_json_loads(payload)
         if data:
@@ -103,14 +146,7 @@ def _extract_meta(text: str) -> Dict[str, Any]:
     except Exception as e:
         print(f"[META] 예외 → 폴백: {e}")
         data = {}
-    
-    # raw : LLM이 준 원시 응답 문자열 (예: json { "msg_keywords": [...], ... } 이런 형태)
-    # raw.find("{") : 문자열에서 첫 번째 {의 위치(인덱스)를 찾음
-    # raw.rfind("}") : 문자열에서 마지막 }의 위치를 찾음
-    # raw[s:e+1] : 그 구간만 잘라서 JSON으로 파싱 시도
-    # else raw : 만약 {}가 아예 없으면 그냥 원문 그대로 사용
-    # 👉 요약:
-    # LLM이 JSON 앞뒤에 불필요한 텍스트나 json 코드펜스를 붙여도, {...} 구간만 추출해서 json.loads()에 안전하게 넘기려는 보호 코드입니다.
+
 
     # 누락 키 보정
     data.setdefault("msg_keywords", [])
@@ -118,6 +154,18 @@ def _extract_meta(text: str) -> Dict[str, Any]:
     data.setdefault("time", None)
     data.setdefault("kind", None)
     data.setdefault("notes", "")
+    
+    def _norm_kw_list(xs):
+        out, seen = [], set()
+        for x in xs or []:
+            t = (x or "").strip().lower()
+            if t and t not in seen:
+                seen.add(t); out.append(t)
+        return out
+
+    data["msg_keywords"] = _norm_kw_list(data.get("msg_keywords"))
+    if data.get("kind"):
+        data["kind"] = (str(data["kind"]).strip().lower())
 
     return data
 # ================== /메타 추출 체인 ==================
@@ -149,42 +197,82 @@ def _mk_sid() -> str:
     print(f"[SESSION-ID] 새 세션 ID: {sid}")
     return sid
 
-def _db_load() -> dict:
-    """
-    conversations.json 읽기. 없거나 비어있으면 기본 구조(dict 기반) 생성.
-    sessions가 list로 저장된 과거 포맷이면 dict로 마이그레이션.
-    """
-    try:
-        with open(_CONVO_STORE, "r", encoding="utf-8") as f:
-            db = json.load(f)
-            #print(f"[JSON-LOAD] {_CONVO_STORE} 로드 성공")
-    except (FileNotFoundError, json.JSONDecodeError):
-        print(f"[JSON-LOAD] {_CONVO_STORE} 없음/비어있음 → 새 DB 구조 생성")
-        db = {"version": 1, "sessions": {}}   # ✅ dict 기반!
+def _resolve_store_path() -> str:    
+    # 1. 환경변수 우선
+    override = os.getenv("CONVO_STORE_PATH")
+    if override and override.startswith("gs://"):
+        #print(f"[PATH] 환경변수(GCS) 경로 사용: {override}")
+        return override
 
-    # --- 안전 정규화(예전 포맷이 list였던 경우 자동 변환) ---
+    # 2. 컨테이너/클라우드 환경 감지
+    in_cloud = bool(
+        os.getenv("K_SERVICE") or 
+        os.getenv("FUNCTION_TARGET") or
+        os.getenv("FIREBASE_CONFIG")
+    )
+    if in_cloud:
+        # 여기에 Cloud Storage 경로를 직접 지정하거나 환경변수로 받아옵니다.
+        # 예: gs://YOUR_BUCKET_NAME/conversations.json
+        bucket_name = os.getenv("GCS_BUCKET") or 'your-project-id.appspot.com'
+        path = f"gs://{bucket_name}/conversations.json"
+        print(f"[PATH] Cloud 환경 감지 → GCS 사용: {path}")
+        return path
+
+    # 3. 로컬
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(current_dir, "conversations.json")
+    #print(f"[PATH] 로컬 경로 사용: {path}") // 모든 대화 내용 출력
+    return path
+
+
+
+def _db_load() -> dict:
+    path = _resolve_store_path()
+    #print(f"_CONVO_STORE : {path}")
+    
+    try:
+        if _is_gs_path(path):
+            raw = _gcs_read_text(path)
+            db = json.loads(raw)
+        else:
+            with open(path, "r", encoding="utf-8") as f:
+                db = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        print(f"[JSON-LOAD] {path} 없음/비어있음 → 새 DB 구조 생성")
+        db = {"version": 1, "sessions": {}}
+
+    # list → dict 마이그레이션 유지
     sess = db.get("sessions")
     if isinstance(sess, list):
-        #print("[JSON-LOAD] sessions가 list 포맷 → dict로 마이그레이션")
         new_sessions = {}
         for s in sess:
             sid = (s.get("meta") or {}).get("session_id") or s.get("id") or f"migrated_{len(new_sessions)+1}"
             new_sessions[sid] = s
         db["sessions"] = new_sessions
-
     if "sessions" not in db or not isinstance(db["sessions"], dict):
-        db["sessions"] = {}  # 최종 방어
-
+        db["sessions"] = {}
     return db
+
 
 #def _db_save(db: Dict[str, Any]) -> None:
 def _db_save(db: dict) -> None:
-    """
-    dict를 conversations.json으로 저장.
-    """
-    with open(_CONVO_STORE, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
-    #print(f"[JSON-SAVE] {_CONVO_STORE} 저장 완료 (세션 수: {len(db.get('sessions', {}))})")  
+    path = _resolve_store_path()
+    payload = json.dumps(db, ensure_ascii=False, indent=2)
+    #print(f"path : {path}, payload : {payload}") // payload: 모든 대화내용 출력 , path :  gs://chatsaju-5cd67-convos/conversations.json
+    if _is_gs_path(path):
+        _gcs_write_text(path, payload)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload)
+
+    # 진단용: 총 턴 수 출력
+    sessions = db.get("sessions", {})
+    turns = 0
+    if isinstance(sessions, dict):
+        for s in sessions.values():
+            turns += len(s.get("turns", []))
+    print(f"[JSON-SAVE] {path} 저장 완료 (세션 수: {len(sessions)}, 총 턴 수: {turns})")
     
 
 #def ensure_session(session_id: Optional[str], title: str = "사주 대화") -> str:
@@ -250,7 +338,7 @@ def record_turn_message(
 
     db["sessions"][session_id]["turns"].append(turn)
     _db_save(db)
-    #print(f"[TURN] 저장 완료: session={session_id}, role={role}")
+    print(f"[TURN] 저장 완료: session={session_id}, role={role}")
 # ================== /JSON 저장 유틸 ==================
 
 
