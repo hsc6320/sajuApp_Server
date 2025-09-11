@@ -165,11 +165,6 @@ def _get_history_stats() -> dict:
     # 당신의 저장소 조회 함수에 맞춰 최소 구현 (예: 최근 1개만 조회)
     rows, total = search_messages(limit=1)  # 없으면 ([], 0)을 가정
     return {"has_history": total > 0, "history_turns": total}
-
-    # 첫 턴(=히스토리 없음)일 때는 LLM 호출조차 하지 않고 바로 False
-    if not hist["has_history"]:
-        print("[REG] no history → regression=False (first turn hard gate)")
-        return question, {"regression": False, "reason": "first_turn_no_history"}
     
 
 # (C) 최종: 회귀 판단 → 맥락 프롬프트 생성

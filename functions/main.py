@@ -4,7 +4,7 @@ import logging
 import os
 import json 
 from dotenv import load_dotenv
-from chat_json_store import ensure_session, record_turn_message
+from chat_json_store import ensure_session, record_turn_message, get_extract_chain, load_conversations_gcs, save_conversations_gcs
 from converting_time import extract_target_ganji_v2
 from regress_chat import build_question_with_regression_context
 from sip_e_un_sung import unseong_for, branch_for, pillars_unseong, seun_unseong
@@ -679,6 +679,28 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         siJi    = data.get("siJi", "") or ""
         currDaewoonGan = data.get("currDaewoonGan", "") or ""
         currDaewoonJi  = data.get("currDaewoonJi", "")  or ""
+        
+        # ---------- (A) 메타 추출 체인 실행 ----------
+        # 프롬프트는 가벼운 템플릿만(외부 I/O 금지)
+        _EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
+            ("system", "사용자 문장에서 시간표현/핵심키워드를 JSON 형식으로만 뽑아라."),
+            ("user", "{text}")
+        ])
+
+        try:
+            extract_chain = get_extract_chain(_EXTRACT_PROMPT)  # ← lazy 생성 (전역 초기화 금지)
+            ext_res = extract_chain.invoke({"text": question})
+            result = getattr(ext_res, "content", ext_res)
+            # 문자열이면 JSON 파싱 시도
+            try:
+                parsed = json.loads(result) if isinstance(result, str) else result
+            except Exception:
+                parsed = result
+            print("🔎 랭체인 키워드 분류")
+            print(parsed)
+        except Exception as e:
+            print(f"🔎 메타 추출 실패: {e}")
+            parsed = []
 
         question_for_llm = None       
             
@@ -747,8 +769,8 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         print(f"오늘 날짜 : {current_year} : {current_month} : {current_day}")
 
         # 상대적 시간표현 → 절대표현으로 변환
-        absolute_keywords, updated_question = convert_relative_time(question, result, current_year, current_month, current_day)
-        print(f"사용자 입력 키워드: {result} ")
+        absolute_keywords, updated_question = convert_relative_time(question, parsed, current_year, current_month, current_day)
+        print(f"사용자 입력 키워드: {parsed} ")
         print(f"변환된 키워드: {absolute_keywords}")
         print(f"🟡 갱신된 질문: {updated_question}")
 
@@ -958,12 +980,15 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                     # "ganji": {"year": "...", "month": "...", "day": "...", "hour": "..."}
                 },
             )
+            
+            # 회귀 빌더에서 만든 질문(맥락 포함) 사용; 없으면 updated_question
+            effective_question = question_for_llm or updated_question
 
             result = chat_with_memory.invoke(
                 {
                    # "user_payload": json.dumps(user_payload, ensure_ascii=False),
                     "payload": json.dumps(user_payload, ensure_ascii=False),
-                    "question": question_for_llm, #updated_question,
+                    "question": effective_question, #updated_question,
                     "summary": summary_text,
                     #"history": []  # history는 RunnableWithMessageHistory가 주입
                 },

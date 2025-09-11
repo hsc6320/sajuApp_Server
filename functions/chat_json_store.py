@@ -71,21 +71,29 @@ _EXTRACT_PROMPT = PromptTemplate(
     ),
 )
 
-#def _get_extract_chain() -> LLMChain:
-def _get_extract_chain():
-    """추출 전용 LLMChain 초기화"""
-    print(f"[CHAIN] 메타추출 체인 초기화: model={os.getenv('EXTRACT_MODEL','gpt-4o-mini')}, temp={os.getenv('EXTRACT_TEMPERATURE','0.0')}")
-    llm_extract = ChatOpenAI(
+def _build_extract_chain():
+    # 전역 import 지연도 안전하게
+    from langchain_openai import ChatOpenAI
+    # _EXTRACT_PROMPT는 문자열/템플릿만 유지(파일/GCS 접근 금지)
+    llm = ChatOpenAI(
         model=os.environ.get("EXTRACT_MODEL", "gpt-4o-mini"),
         temperature=float(os.environ.get("EXTRACT_TEMPERATURE", "0.0")),
-        max_tokens=300,
-        timeout=25,
-    )   
-      
-    #return LLMChain(llm=llm_extract, prompt=_EXTRACT_PROMPT)
-    return _EXTRACT_PROMPT | llm_extract
+        max_tokens=500,
+        timeout=45,
+        max_retries=2,
+        # JSON 모드 쓰면 파싱 안정↑ (선택)
+        # model_kwargs={"response_format": {"type": "json_object"}},
+    )
+    return _EXTRACT_PROMPT | llm
 
-_EXTRACT_CHAIN = _get_extract_chain()
+
+def get_extract_chain():
+    global _EXTRACT_CHAIN
+    if _EXTRACT_CHAIN is None:
+        print("[BOOT] building extract chain lazily")
+        _EXTRACT_CHAIN = _build_extract_chain()
+    return _EXTRACT_CHAIN
+
 
 
 _CODEFENCE_RE = re.compile(r"```[a-zA-Z]*\s*([\s\S]*?)```", re.MULTILINE)
@@ -483,3 +491,40 @@ def format_search_results(rows: list[dict]) -> list[dict]:
             "kind": r.get("kind"),
         })
     return out
+
+
+_gcs_client = None
+
+def _get_gcs_client():
+    global _gcs_client
+    if _gcs_client is None:
+        from google.cloud import storage
+        _gcs_client = storage.Client()
+    return _gcs_client
+
+def load_conversations_gcs(bucket_name: str, blob_path: str) -> dict:
+    """
+    GCS에서 conversations.json 로드. import 시점이 아니라 '호출 시점'에만 접근.
+    """
+    try:
+        client = _get_gcs_client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_path)
+        if not blob.exists():
+            print(f"[JSON-LOAD] gs://{bucket_name}/{blob_path} 없음/비어있음 → 새 DB 구조 생성")
+            return {"sessions": {}, "total_turns": 0}
+        content = blob.download_as_text(encoding="utf-8")
+        return json.loads(content) if content.strip() else {"sessions": {}, "total_turns": 0}
+    except Exception as e:
+        print(f"[JSON-LOAD] 예외 → 새 구조 폴백: {e}")
+        return {"sessions": {}, "total_turns": 0}
+
+def save_conversations_gcs(bucket_name: str, blob_path: str, data: dict):
+    try:
+        client = _get_gcs_client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_path)
+        blob.upload_from_string(json.dumps(data, ensure_ascii=False), content_type="application/json")
+        print(f"[JSON-SAVE] gs://{bucket_name}/{blob_path} 저장 완료 (세션 수: {len(data.get('sessions', {}))}, 총 턴 수: {data.get('total_turns', 0)})")
+    except Exception as e:
+        print(f"[JSON-SAVE] 예외: {e}")
