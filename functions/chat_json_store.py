@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from langchain_core.prompts import ChatPromptTemplate
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 from langchain_openai import ChatOpenAI
@@ -57,43 +58,40 @@ _TEMPERATURE  = float(os.environ.get("EXTRACT_TEMPERATURE", "0.0"))
 # 사용 목적: 사용자 질문 한 문장에서
 #  - msg_keywords / target_date / time / kind / notes 를 JSON으로 추출
 #  - conversations.json에 함께 저장
-_EXTRACT_PROMPT = PromptTemplate(
-    input_variables=["text"],   # {text} 변수만 받음
-    template=(
-        "아래 문장에서 대화 저장용 메타데이터를 JSON으로 추출하라.\n"
-        "출력은 반드시 JSON만, 키는 정확히 다음만 포함:\n"
-        "- msg_keywords: 핵심 키워드 배열\n"
-        "- target_date: 날짜가 있으면 ISO(YYYY-MM-DD), 없으면 null\n"
-        "- time: 시/분이 있으면 HH:MM, 없으면 null\n"
-        "- kind: 면접/시험/여행/회의/계약/결혼/병원/주식 중 하나 또는 null\n"
-        "- notes: 문장 요약 (한 줄)\n\n"
-        "문장: {text}"
-    ),
-)
+_EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", (
+        "사용자 발화를 분석해 아래 스키마의 JSON만 출력하라(설명/주석/코드블록 금지).\n"
+        "{{\"msg_keywords\": [\"string\"], "
+        "\"target_date\": null, "
+        "\"time\": null, "
+        "\"kind\": null, "
+        "\"notes\": \"string\"}}"
+    )),
+    ("user", "{text}")
+])
 
-def _build_extract_chain():
-    # 전역 import 지연도 안전하게
-    from langchain_openai import ChatOpenAI
-    # _EXTRACT_PROMPT는 문자열/템플릿만 유지(파일/GCS 접근 금지)
+
+def get_extract_chain():
+    """
+    OpenAI API 키가 설정되어 있을 때만 체인을 빌드합니다.
+    @lru_cache를 사용하여 첫 호출 시에만 체인을 생성합니다.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    
+    if not api_key:
+        print("[META] OPENAI_API_KEY not set — meta extraction will be skipped")
+        return None
+
     llm = ChatOpenAI(
         model=os.environ.get("EXTRACT_MODEL", "gpt-4o-mini"),
         temperature=float(os.environ.get("EXTRACT_TEMPERATURE", "0.0")),
         max_tokens=500,
         timeout=45,
         max_retries=2,
-        # JSON 모드 쓰면 파싱 안정↑ (선택)
-        # model_kwargs={"response_format": {"type": "json_object"}},
+        openai_api_key=api_key,
+        model_kwargs={"response_format": {"type": "json_object"}},
     )
     return _EXTRACT_PROMPT | llm
-
-
-def get_extract_chain():
-    global _EXTRACT_CHAIN
-    if _EXTRACT_CHAIN is None:
-        print("[BOOT] building extract chain lazily")
-        _EXTRACT_CHAIN = _build_extract_chain()
-    return _EXTRACT_CHAIN
-
 
 
 _CODEFENCE_RE = re.compile(r"```[a-zA-Z]*\s*([\s\S]*?)```", re.MULTILINE)
@@ -142,7 +140,8 @@ def _extract_meta(text: str) -> Dict[str, Any]:
 
     try:
         # run 또는 invoke 어떤 걸 쓰더라도 _to_text로 정규화
-        res = _EXTRACT_CHAIN.invoke({"text": text})
+        extract_chain = get_extract_chain()
+        res = extract_chain.invoke({"text": text})
         raw = _to_text(res)
         #print(f"[META] 원시 응답: {raw}")  //사용자 질문
         payload = _extract_json_block(raw)
@@ -235,6 +234,7 @@ def _resolve_store_path() -> str:
 
 
 def _db_load() -> dict:
+    print("_db_load()")
     path = _resolve_store_path()
     #print(f"_CONVO_STORE : {path}")
     

@@ -165,18 +165,6 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
     relative_to_ganji_map = {}  # 👈 상대 표현 → 간지
     context_year = None
 
-    # ✅ expressions 정규화: dict → 값 추출
-    # cleaned_items = []
-    # for x in expressions:
-    #     if isinstance(x, dict):
-    #         for v in x.values():
-    #             if isinstance(v, list):
-    #                 cleaned_items.extend(v)
-    #             else:
-    #                 cleaned_items.append(str(v))
-    #     else:
-    #         cleaned_items.append(str(x))
-
 
     #for item in expressions:
     for item in sorted((str(x).strip() for x in expressions), key=len, reverse=True):
@@ -289,7 +277,7 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
             if month_match := re.search(r"\d{1,2}월", item):
                 absolute_expressions.append(month_match.group())
         
-        elif (m2 := re.search(r"(?<!\d)(\d{2})\s*년\b", item)):
+        elif (m2 := re.search(r"(?<!\d)(\d{2})\s*년\s*년도\b", item)):
             token_2digit = m2.group(0)                  # 실제 매칭된 원문: '24년' or '24 년'
             year_suffix = int(m2.group(1))
 

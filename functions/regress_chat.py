@@ -1,7 +1,9 @@
 # ================== 회귀(이전 대화 회귀) 감지/맥락 결합 ==================
 import json
 import os
-from typing import Tuple
+
+from typing import Any, Dict, List, Optional, Tuple
+import json
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -31,7 +33,7 @@ _REG_PROMPT = ChatPromptTemplate.from_messages([
 - False 조건(예시): '사주/운세/올해/내년/2025' 같은 일반 단어만 비슷하거나, 전혀 새로운 주제.
 
 JSON 한 줄로만 응답:
-{"is_regression": <true|false>, "confidence": 0.0~1.0, "topic_keywords": [], "explicit_markers": [], "reasons": "짧은 이유"}
+{{\"is_regression\": <true|false>, \"confidence\": 0.0~1.0, \"topic_keywords\": [], \"explicit_markers\": [], \"reasons\": "짧은 이유"}}
 """),
     ("user", "has_history={has_history}\nhistory_turns={history_turns}\n\n## summary\n{summary}\n\n## utterance\n{question}\n\nJSON만 출력.")
 ])
@@ -87,7 +89,7 @@ _REG_CHAIN = _get_regression_chain()
 
 def _llm_detect_regression(question: str, summary_text: str, hist: dict) -> dict:
     try:
-        print("_llm_detect_regression() Q :{question} : {summary_text}")
+        print(f"_llm_detect_regression() Q :{question} : {summary_text}")
         res = _REG_CHAIN.invoke({
             "has_history": hist.get("has_history", False),
             "history_turns": hist.get("history_turns", 0),
@@ -187,6 +189,7 @@ def build_question_with_regression_context(question: str, summary_text: str) -> 
     use_regression = bool(reg.get("is_regression")) and float(reg.get("confidence", 0.0)) >= conf_th
 
     if use_regression:
+        print(f"use_regression : {use_regression}")
         # 회귀 True → 과거 문맥을 '선택'만 시도 (실패해도 회귀 True 유지)
         merged_kws = list(set((meta_now.get("msg_keywords") or []) + (reg.get("topic_keywords") or [])))
         context_rows, dbg = _pick_related_context_by_overlap({"msg_keywords": merged_kws, "kind": meta_now.get("kind"), "notes": meta_now.get("notes")})

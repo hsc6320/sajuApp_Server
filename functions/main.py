@@ -4,9 +4,10 @@ import logging
 import os
 import json 
 from dotenv import load_dotenv
-from chat_json_store import ensure_session, record_turn_message, get_extract_chain, load_conversations_gcs, save_conversations_gcs
+from chat_json_store import _db_load, ensure_session, record_turn_message, get_extract_chain, load_conversations_gcs, save_conversations_gcs
 from converting_time import extract_target_ganji_v2
-from regress_chat import build_question_with_regression_context
+#from regress_chat import build_question_with_regression_context
+from regress_conversation import build_question_with_regression_context
 from sip_e_un_sung import unseong_for, branch_for, pillars_unseong, seun_unseong
 from converting_time import convert_relative_time
 from Sipsin import get_sipshin, get_ji_sipshin_only
@@ -453,27 +454,27 @@ categoryDetail_chain = LLMChain(llm=llm, prompt=categoryDetail_prompt)
 
 
 # 3. 최종 카테고리 분류 함수 (키워드 → LLM fallback)
-def classify_question(question: str) -> str:
-    """
-    사용자 질문을 'saju' | 'fortune' | 'counsel' 중 하나로 분류한다.
-    1) keyword_category(): 규칙 기반 키워드 매칭
-    2) category_chain.run(): LLM 기반 보조 분류
-    """
-    # # 1차: 키워드 기반 분류
-    # category = keyword_category(question)
-    # if category:
-    #     print(f"🔍 키워드 기반 분류: {category}")
-    #     return category
+# def classify_question(question: str) -> str:
+#     """
+#     사용자 질문을 'saju' | 'fortune' | 'counsel' 중 하나로 분류한다.
+#     1) keyword_category(): 규칙 기반 키워드 매칭
+#     2) category_chain.run(): LLM 기반 보조 분류
+#     """
+#     # # 1차: 키워드 기반 분류
+#     # category = keyword_category(question)
+#     # if category:
+#     #     print(f"🔍 키워드 기반 분류: {category}")
+#     #     return category
 
-    # 2차: LLM 기반 분류
-    category = categoryDetail_chain.run(question).strip().lower()    
+#     # 2차: LLM 기반 분류
+#     category = categoryDetail_chain.invoke(question).strip().lower()
 
-    # 안전장치: 예상 외 값이 나오면 'counsel'로 폴백
-    if category not in ["saju", "fortune", "counsel"]:
-        print(f"⚠️ 예상치 못한 카테고리: {category} → counsel로 폴백")
-        return "counsel"
+#     # 안전장치: 예상 외 값이 나오면 'counsel'로 폴백
+#     if category not in ["saju", "fortune", "counsel"]:
+#         print(f"⚠️ 예상치 못한 카테고리: {category} → counsel로 폴백")
+#         return "counsel"
 
-    return category
+#     return category
 
 llm2 = ChatOpenAI(temperature=0.2)
 schema = {
@@ -498,6 +499,14 @@ def get_summary_text() -> str:
         return getattr(global_memory, "moving_summary_buffer", "") or ""
     except Exception:
         return ""
+
+def get_session_brief_summary(session_id: str, n: int = 6) -> str:
+    db = _db_load()
+    sess = (db.get("sessions") or {}).get(session_id) or {}
+    turns = sess.get("turns") or []
+    return "\n".join(f"{t.get('role','')}: {(t.get('text') or '').strip().replace('\n',' ')}"
+                     for t in turns[-n:])
+
 
 def set_summary_text(text: str) -> None:
     """요약을 메모리에만 저장(교체)."""
@@ -648,6 +657,42 @@ def is_fortune_query(text: str) -> bool:
 def looks_like_regression(text: str) -> bool:
     return any(kw in text for kw in ["다시", "지난번", "그때", "전에"])
 
+# --- (B) 메타 추출 및 시간 변환 로직 함수 ---
+def _extract_and_convert(question: str):
+    """
+    질문에서 메타데이터를 추출하고 상대적 시간을 절대 시간으로 변환합니다.
+    """
+    extract_chain = get_extract_chain()
+    if not extract_chain:
+        print("[META] skip: OPENAI_API_KEY not set")
+        return {}
+
+    try:
+        ext_res = extract_chain.invoke({"text": question})
+        raw = ext_res.content if hasattr(ext_res, "content") else str(ext_res)
+        print(f"ext_res : {ext_res}")
+        parsed = json.loads(raw)
+        print(f"parsed : {parsed}")
+    except Exception as e:
+        print(f"🔎 메타 추출/파싱 실패: {type(e).__name__}: {e}")
+        return {}
+    
+    # 상대적 시간 → 절대 시간 변환
+    try:
+        absolute_keywords, updated_question = convert_relative_time(
+            question,  parsed["msg_keywords"], datetime.now().year, datetime.now().month, datetime.now().day
+        )
+        print(f"🟡 변환된 키워드: {absolute_keywords}")
+        print(f"🟡 갱신된 질문: {updated_question}")
+        parsed["absolute_keywords"] = absolute_keywords
+        parsed["updated_question"] = updated_question
+        
+    except Exception as e:
+        return {}
+        print(f"❌ 시간 변환 실패: {e}")
+    
+    return parsed
+
 # 5. Firebase 함수 엔드포인트
 @https_fn.on_request(memory=2048, timeout_sec=60)
 def ask_saju(req: https_fn.Request) -> https_fn.Response:
@@ -682,25 +727,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         
         # ---------- (A) 메타 추출 체인 실행 ----------
         # 프롬프트는 가벼운 템플릿만(외부 I/O 금지)
-        _EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
-            ("system", "사용자 문장에서 시간표현/핵심키워드를 JSON 형식으로만 뽑아라."),
-            ("user", "{text}")
-        ])
-
-        try:
-            extract_chain = get_extract_chain(_EXTRACT_PROMPT)  # ← lazy 생성 (전역 초기화 금지)
-            ext_res = extract_chain.invoke({"text": question})
-            result = getattr(ext_res, "content", ext_res)
-            # 문자열이면 JSON 파싱 시도
-            try:
-                parsed = json.loads(result) if isinstance(result, str) else result
-            except Exception:
-                parsed = result
-            print("🔎 랭체인 키워드 분류")
-            print(parsed)
-        except Exception as e:
-            print(f"🔎 메타 추출 실패: {e}")
-            parsed = []
+        
 
         question_for_llm = None       
             
@@ -711,14 +738,19 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         #     print(f"🔎 ext_chain.invoke 실패: {e}")
         #     ext_result = {}
             
-        result = ext_chain.run(question)
-        print("🔎 랭체인 키워드 분류")
-        print(result)
+        # result = ext_chain.run(question)
+        # print("🔎 랭체인 키워드 분류")
+        # print(result)
+        
+        # 2. 메타 추출 및 시간 변환: 재사용 가능한 함수로 분리
+        parsed_meta = _extract_and_convert(question)
+        updated_question = parsed_meta.get("updated_question", question) #"updated_question" 값이 없다면 원래 질문 "question"을 리턴함
+        
 
         print(f"🧑 이름: {user_name}, 🌿 간지: {sajuganji}, 📊 대운: {daewoon}, 현재: {current_daewoon}")
         print(f"십성정보 : 년간 {yearGan}/{yearJi} 월간{wolGan}/{wolJi} 대운{currDaewoonGan}/{currDaewoonJi}")
         print(f"년주: {year} 월주: {month}")
-        print(f"❓ 질문: {question}")
+        print(f"❓ 질문: {question} {updated_question}")
         
         {
         # print("===========================테스트 코드 ===============================")
@@ -767,19 +799,22 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         current_month = datetime.now().month
         current_day = datetime.now().day
         print(f"오늘 날짜 : {current_year} : {current_month} : {current_day}")
+                
+        # if not parsed:
+        #     absolute_keywords, updated_question = convert_relative_time(question, parsed, current_year, current_month, current_day)
+        #     print(f"사용자 입력 키워드: {parsed} ")
+        # print(f"변환된 키워드: {absolute_keywords}")
+        # print(f"🟡 갱신된 질문: {updated_question}")
 
-        # 상대적 시간표현 → 절대표현으로 변환
-        absolute_keywords, updated_question = convert_relative_time(question, parsed, current_year, current_month, current_day)
-        print(f"사용자 입력 키워드: {parsed} ")
-        print(f"변환된 키워드: {absolute_keywords}")
-        print(f"🟡 갱신된 질문: {updated_question}")
-
-        print(f"summary_text : {summary_text}")
         
-       
+       # 0) 세션 먼저 보장
+        session_id = ensure_session(session_id, title="사주 대화")
+
         # ✅ 요약 텍스트 가져오기 (이미 쓰는 전역 메모리 그대로)
         #summary_text = global_memory.moving_summary_buffer or ""
         summary_text = get_summary_text()
+        summary_text = get_session_brief_summary(session_id)
+        print(f"summary_text : {summary_text}")
         
         
         # --- 회귀(이전 대화 회수) ---
@@ -788,8 +823,8 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         print(f"[REG] 최종 회귀 상태: {reg_dbg}")
 
         #1차 분류
-        category = classify_question(updated_question)
-        print(f"📂 최종 분류 결과: {category}")
+        #category = classify_question(updated_question)
+        #print(f"📂 최종 분류 결과: {category}")
 
         # ──────────────────────────────── fortune(점괘) 분기 ────────────────────────────────
         #if category == "fortune":
