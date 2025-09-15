@@ -7,9 +7,9 @@ import json
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
-from chat_json_store import _extract_meta, format_search_results, search_messages
+from chat_json_store import format_search_results
+from regress_conversation import search_messages, _extract_meta
 from langchain.memory import ConversationSummaryBufferMemory, ChatMessageHistory
-from langchain_openai import ChatOpenAI
 from langchain.chains import LLMChain
 
 def _jaccard(a: set[str], b: set[str]) -> float:
@@ -41,7 +41,7 @@ JSON 한 줄로만 응답:
 def _get_regression_chain():
     model = os.environ.get("REG_MODEL", "gpt-4o-mini")
     temp = float(os.environ.get("REG_TEMPERATURE", "0.0"))
-    print(f"[CHAIN] 회귀판정 체인 초기화: model={model}, temp={temp}")
+    #print(f"[CHAIN] 회귀판정 체인 초기화: model={model}, temp={temp}")
     
     llm = ChatOpenAI(
         model=model,
@@ -108,6 +108,7 @@ def _llm_detect_regression(question: str, summary_text: str, hist: dict) -> dict
     data.setdefault("explicit_markers", [])
     data.setdefault("reasons", "")
     return data
+
 
 
 # (B) 히스토리 키워드 겹침으로 가장 관련 세그먼트 선택

@@ -4,12 +4,10 @@ import logging
 import os
 import json 
 from dotenv import load_dotenv
-from chat_json_store import _db_load, ensure_session, record_turn_message, get_extract_chain, load_conversations_gcs, save_conversations_gcs
-from converting_time import extract_target_ganji_v2
-#from regress_chat import build_question_with_regression_context
-from regress_conversation import build_question_with_regression_context
+from regress_conversation import _db_load, ensure_session, record_turn_message, get_extract_chain, build_question_with_regression_context
+from converting_time import extract_target_ganji_v2, convert_relative_time
+from regress_Deixis import _make_bridge, build_regression_and_deixis_context
 from sip_e_un_sung import unseong_for, branch_for, pillars_unseong, seun_unseong
-from converting_time import convert_relative_time
 from Sipsin import get_sipshin, get_ji_sipshin_only
 from choshi_64 import GUA
 from ganji_converter import get_ilju, get_wolju_from_date, get_year_ganji_from_json, JSON_PATH
@@ -341,17 +339,57 @@ SAJU_COUNSEL_SYSTEM = """
 - {summary}를 확인하고 직전 응답이 SAJU 모드였다면, 후속 질문이 일상적/가벼워도 사주 해석 맥락과 연결해 자연스럽게 이어서 답한다.
 - COUNSEL 모드로 보내야 하는 질문이어도, 사주 기반 조언을 부드럽게 덧붙일 수 있다면 함께 제공해라.
 
+# ───────── 맥락 강화 규칙(추가) ─────────
+- 반드시 **첫 문장**은 그대로 출력한다: "{bridge}"
+- 아래 [FACTS]의 정보(날짜/장소/인물 등)가 있으면 **첫 1~2문장**에 자연스럽게 명시해라.
+- [CONTEXT]의 과거 대화에 근거해 '맥락 브릿지'를 만든 뒤, 그 범위를 벗어나 **새 대주제(결혼/승진/재물 등)로 비약하지 마라**.
+- [CONTEXT]에 없는 사실을 단정하지 마라. 중복 일반론 나열 금지.
+
+
 [대화 요약]
 {summary}
 
 [사용자 질문]
 {question}
 """
+
+SAJU_COUNSEL_SYSTEM = SAJU_COUNSEL_SYSTEM + """
+
+[표현 금지 / 시작 규칙]
+- '이어서 답변 드릴게요', '이어서', '이어', '계속해서', '다시', '답변 드리겠습니다' 등 **전환 문구로 시작 금지**.
+- 첫 문장은 바로 **핵심 요약**으로 시작. 불필요한 서두 금지.
+- 아래 [CONTEXT]/[FACTS]/[BRIDGE]는 참고용으로만 사용하고, **문구를 그대로 답변에 쓰지 말 것**.
+"""
+
+# counseling_prompt = ChatPromptTemplate.from_messages([
+#     SystemMessage(content=SAJU_COUNSEL_SYSTEM),
+#     # 메모리 포함
+#     ("system", "이전 대화 요약:\n{summary}"),
+#     ("human", "JSON:\n{payload}\n\n질문: {question}")
+# ])
 counseling_prompt = ChatPromptTemplate.from_messages([
+    # 기존 시스템 규칙
     SystemMessage(content=SAJU_COUNSEL_SYSTEM),
-    # 메모리 포함
+
+    # 기존 요약 주입(유지)
     ("system", "이전 대화 요약:\n{summary}"),
-    ("human", "JSON:\n{payload}\n\n질문: {question}")
+
+    # 🔥 추가: 브릿지/컨텍스트/팩트 사용을 '규칙'으로 강제
+    ("system",
+     '출력 규칙(중요):\n'
+     '- 반드시 **첫 문장**은 그대로 출력한다: "{bridge}"\n'
+     '- 아래 [FACTS]에 날짜/장소/인물 등이 있으면 **첫 1~2문장**에 자연스럽게 명시한다.\n'
+     '- [CONTEXT]의 과거 대화 범위를 벗어나 새로운 대주제로 비약하지 말 것.\n'
+     '- [CONTEXT]에 없는 사실을 단정하지 말 것. 중복 일반론 나열 금지.'
+    ),
+
+    # 기존 휴먼 입력에 CONTEXT/FACTS/JSON/질문만 확장
+    ("human",
+     "[CONTEXT]\n{context}\n\n"
+     "[FACTS]\n{facts}\n\n"
+     "[입력 데이터(JSON)]\n{payload}\n\n"
+     "[사용자 질문]\n{question}"
+    ),
 ])
 
 
@@ -540,7 +578,7 @@ def record_turn(user_text: str, assistant_text: str, payload: dict | None = None
     print("\n🧠 현재 global_memory.moving_summary_buffer (요약) 내용:") 
     print(f"메모리 내 메시지 수: {len(global_memory.chat_memory.messages)}") 
     print(f"현재 토큰 수 (추정): {len(str(global_memory.chat_memory.messages)) // 4}") 
-    print(f"요약 버퍼 내용:\n{get_summary_text()}") 
+    #print(f"요약 버퍼 내용:\n{get_summary_text()}") 
     print("================== record_turn end ==================\n")
 
 def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
@@ -643,7 +681,6 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         }
     }
 
-    print("[make_saju_payload] ✅ payload 구성 완료")
     return payload
 
 
@@ -678,11 +715,12 @@ def _extract_and_convert(question: str):
         return {}
     
     # 상대적 시간 → 절대 시간 변환
+    print(f"상대적 시간{datetime.now().year}/ {datetime.now().month}/ {datetime.now().day}")
     try:
         absolute_keywords, updated_question = convert_relative_time(
             question,  parsed["msg_keywords"], datetime.now().year, datetime.now().month, datetime.now().day
         )
-        print(f"🟡 변환된 키워드: {absolute_keywords}")
+        #print(f"🟡 변환된 키워드: {absolute_keywords}")
         print(f"🟡 갱신된 질문: {updated_question}")
         parsed["absolute_keywords"] = absolute_keywords
         parsed["updated_question"] = updated_question
@@ -750,7 +788,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         print(f"🧑 이름: {user_name}, 🌿 간지: {sajuganji}, 📊 대운: {daewoon}, 현재: {current_daewoon}")
         print(f"십성정보 : 년간 {yearGan}/{yearJi} 월간{wolGan}/{wolJi} 대운{currDaewoonGan}/{currDaewoonJi}")
         print(f"년주: {year} 월주: {month}")
-        print(f"❓ 질문: {question} {updated_question}")
+        #print(f"❓ 질문: {question} {updated_question}")
         
         {
         # print("===========================테스트 코드 ===============================")
@@ -794,18 +832,19 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         # print("===============================================================")
         }
          # 현재 연도/월 기준으로 변환
-        
-        current_year = datetime.now().year
-        current_month = datetime.now().month
-        current_day = datetime.now().day
-        print(f"오늘 날짜 : {current_year} : {current_month} : {current_day}")
+       
+        {
+        # current_year = datetime.now().year
+        # current_month = datetime.now().month
+        # current_day = datetime.now().day
+        # print(f"오늘 날짜 : {current_year} : {current_month} : {current_day}")
                 
         # if not parsed:
         #     absolute_keywords, updated_question = convert_relative_time(question, parsed, current_year, current_month, current_day)
         #     print(f"사용자 입력 키워드: {parsed} ")
         # print(f"변환된 키워드: {absolute_keywords}")
         # print(f"🟡 갱신된 질문: {updated_question}")
-
+        }
         
        # 0) 세션 먼저 보장
         session_id = ensure_session(session_id, title="사주 대화")
@@ -819,7 +858,12 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         
         # --- 회귀(이전 대화 회수) ---
         # ✅ 회귀 판단 + 맥락 결합 (키워드 리스트 따로 만들 필요 없음)
-        question_for_llm, reg_dbg = build_question_with_regression_context(question=updated_question, summary_text=summary_text)
+       # question_for_llm, reg_dbg = build_question_with_regression_context(question=updated_question, summary_text=summary_text)
+        reg_prompt, reg_dbg = build_regression_and_deixis_context(
+                                        question=updated_question,
+                                        summary_text=summary_text,
+                                        session_id=session_id,   # ★ 반드시 전달 → [JSON_SCAN] sid=None 방지
+                                    )
         print(f"[REG] 최종 회귀 상태: {reg_dbg}")
 
         #1차 분류
@@ -983,7 +1027,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
 
             #chain = saju_prompt | ChatOpenAI(
             chain = counseling_prompt | ChatOpenAI(
-                temperature=1.0, 
+                temperature=0.6, 
                 #model_kwargs={"top_p": 0.9},
                 top_p = 0.9,
                 openai_api_key=openai_key,
@@ -1017,15 +1061,30 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             )
             
             # 회귀 빌더에서 만든 질문(맥락 포함) 사용; 없으면 updated_question
-            effective_question = question_for_llm or updated_question
-
+            effective_question = updated_question
+            bridge_text = _make_bridge(reg_dbg.get("facts", {}))
+            facts_json   = json.dumps(reg_dbg.get("facts", {}), ensure_ascii=False)
+            
+            # result = chat_with_memory.invoke(
+            #     {
+            #        # "user_payload": json.dumps(user_payload, ensure_ascii=False),
+            #         "payload": json.dumps(user_payload, ensure_ascii=False),
+            #         "question": effective_question, #updated_question,              # 히스토리 키
+            #         "bridge": bridge_text,                                          # ★ 첫 문장 강제
+            #         "summary": summary_text,
+            #         #"history": []  # history는 RunnableWithMessageHistory가 주입
+            #     },
+            #     config={"configurable": {"session_id": session_id}},
+            # )
+            
             result = chat_with_memory.invoke(
                 {
-                   # "user_payload": json.dumps(user_payload, ensure_ascii=False),
+                    "context": reg_prompt,                              # 회귀/컨텍스트 전문
+                    "facts": facts_json,                                # 구조화 FACT
+                    "summary": summary_text,                            # moving_summary_buffer
+                    "question": effective_question,         # 히스토리 키
+                    "bridge": bridge_text,                              # ★ 첫 문장 강제
                     "payload": json.dumps(user_payload, ensure_ascii=False),
-                    "question": effective_question, #updated_question,
-                    "summary": summary_text,
-                    #"history": []  # history는 RunnableWithMessageHistory가 주입
                 },
                 config={"configurable": {"session_id": session_id}},
             )

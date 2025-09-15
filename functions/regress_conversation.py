@@ -8,12 +8,12 @@
 # 3) 반환 debug에는 LLM 판정, JSON 검색 요약, FACT 주입 정보까지 모두 담아 로깅/저장 가능.
 # -------------------------------------------------
 from functools import lru_cache
+import time
 from langchain_core.prompts import ChatPromptTemplate
 #from __future__ import annotations
 from typing import Any, Dict, List, Tuple, Optional
 import os, re, json
 from datetime import datetime, timedelta
-from chat_json_store import _db_load
 from langchain_openai import ChatOpenAI
 try:
     from zoneinfo import ZoneInfo  # Py3.9+
@@ -44,6 +44,31 @@ JSON 한 줄로만 응답:
     ("user", "has_history={has_history}\nhistory_turns={history_turns}\n\n## summary\n{summary}\n\n## utterance\n{question}\n\nJSON만 출력.")
 ])
 
+
+# ───────── GCS 유틸 ─────────
+from google.cloud import storage
+
+
+def _parse_gs_path(gs_path: str) -> tuple[str, str]:
+    # gs://bucket/name/with/slashes.json -> (bucket, name/with/slashes.json)
+    no_scheme = gs_path[len("gs://"):]
+    parts = no_scheme.split("/", 1)
+    bucket = parts[0]
+    name = parts[1] if len(parts) > 1 else ""
+    #print(f"_parse_gs_path({str}, name : {name})")
+    return bucket, name
+
+
+def _gcs_read_text(gs_path: str) -> str:
+    bucket, name = _parse_gs_path(gs_path)
+    client = storage.Client()
+    bkt = client.bucket(bucket)
+    blob = bkt.blob(name)
+    if not blob.exists(client):
+        raise FileNotFoundError(gs_path)
+    return blob.download_as_text(encoding="utf-8")
+
+
 # ------- 유틸: 안전 자카드 (키워드 겹침 점수) --------------------------------
 def _jaccard_safe(a: List[str] | set, b: List[str] | set) -> float:
     A = set([x for x in (a or []) if x])
@@ -65,7 +90,7 @@ def _get_regression_chain():
 
     model = os.environ.get("REG_MODEL", "gpt-4o-mini")
     temp  = float(os.environ.get("REG_TEMPERATURE", "0.0"))
-    print(f"[CHAIN] 회귀판정 체인 초기화: model={model}, temp={temp}")
+    #print(f"[CHAIN] 회귀판정 체인 초기화: model={model}, temp={temp}")
 
     llm = ChatOpenAI(
         model=model,
@@ -348,7 +373,7 @@ def _extract_meta(text: str) -> Dict[str, Any]:
     - get_extract_chain()은 JSON 응답(response_format=json_object) 강제된 체인이어야 함.
     - 키가 빠져도 기본값 세팅.
     """
-    print(f"[META] 입력 문장: {text}")
+    print(f"regress_conversations\n[META] 입력 문장: {text}")
     data = {}
 
     try:
@@ -391,31 +416,6 @@ def _extract_meta(text: str) -> Dict[str, Any]:
     return data
 
 
-def _get_history_stats(session_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    회귀 게이트에 필요한 최소 통계만 리턴.
-    - has_history: 세션에 저장된 턴이 1개 이상인지
-    - history_turns: 턴 개수
-    - session_id: 사용된 세션 ID (없으면 첫 세션을 자동 선택)
-
-    주의: 여기서는 무거운 의존성 없이 conversations.json만 확인합니다.
-    """
-    db = _db_load()
-    sessions = db.get("sessions") or {}
-
-    # 세션이 지정되지 않았다면 첫 세션을 선택 (서비스 정책에 맞게 조정 가능)
-    if session_id is None:
-        session_id = next(iter(sessions), None)
-
-    sess = sessions.get(session_id) or {}
-    turns = (sess.get("turns") or [])
-    print(f"turns {turns}")
-
-    return {
-        "has_history": len(turns) > 0,
-        "history_turns": len(turns),
-        "session_id": session_id,
-    }
     
 def _llm_detect_regression(question: str, summary_text: str, hist: dict) -> dict:
     try:
@@ -448,6 +448,33 @@ def _llm_detect_regression(question: str, summary_text: str, hist: dict) -> dict
     return data
 
 
+def _get_history_stats(session_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    회귀 게이트에 필요한 최소 통계만 리턴.
+    - has_history: 세션에 저장된 턴이 1개 이상인지
+    - history_turns: 턴 개수
+    - session_id: 사용된 세션 ID (없으면 첫 세션을 자동 선택)
+
+    주의: 여기서는 무거운 의존성 없이 conversations.json만 확인합니다.
+    """
+    db = _db_load()
+    sessions = db.get("sessions") or {}
+
+    # 세션이 지정되지 않았다면 첫 세션을 선택 (서비스 정책에 맞게 조정 가능)
+    if session_id is None:
+        session_id = next(iter(sessions), None)
+
+    sess = sessions.get(session_id) or {}
+    turns = (sess.get("turns") or [])
+    print(f"turns {turns}")
+
+    return {
+        "has_history": len(turns) > 0,
+        "history_turns": len(turns),
+        "session_id": session_id,
+    }
+    
+    
 # ------- 외부 공개: 질문 + JSON맥락 결합 (회귀 대응) --------------------------
 def build_question_with_regression_context(
     question: str,
@@ -555,3 +582,298 @@ def build_question_with_regression_context(
 
     # 아무 맥락도 못 붙였으면 그냥 원문 반환(디버그로 회귀 흔적만 남음)
     return question, debug
+
+
+def _is_gs_path(p: str) -> bool:
+    return isinstance(p, str) and p.startswith("gs://")
+
+def _resolve_store_path() -> str:    
+    # 1. 환경변수 우선
+    override = os.getenv("CONVO_STORE_PATH")
+    if override and override.startswith("gs://"):
+        #print(f"[PATH] 환경변수(GCS) 경로 사용: {override}")
+        return override
+
+    # 2. 컨테이너/클라우드 환경 감지
+    in_cloud = bool(
+        os.getenv("K_SERVICE") or 
+        os.getenv("FUNCTION_TARGET") or
+        os.getenv("FIREBASE_CONFIG")
+    )
+    if in_cloud:
+        # 여기에 Cloud Storage 경로를 직접 지정하거나 환경변수로 받아옵니다.
+        # 예: gs://YOUR_BUCKET_NAME/conversations.json
+        bucket_name = os.getenv("GCS_BUCKET") or 'your-project-id.appspot.com'
+        path = f"gs://{bucket_name}/conversations.json"
+        print(f"[PATH] Cloud 환경 감지 → GCS 사용: {path}")
+        return path
+
+    # 3. 로컬
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(current_dir, "conversations.json")
+    #print(f"[PATH] 로컬 경로 사용: {path}") // 모든 대화 내용 출력
+    return path
+
+
+def _gcs_write_text(gs_path: str, text: str) -> None:
+    bucket, name = _parse_gs_path(gs_path)
+    client = storage.Client()
+    bkt = client.bucket(bucket)
+    blob = bkt.blob(name)
+    blob.cache_control = "no-store"
+    blob.content_type = "application/json"
+    blob.upload_from_string(text, content_type="application/json")
+    #print(f"[JSON-SAVE] GCS {gs_path} 저장 완료 (size={len(text)} bytes)")
+
+
+def _db_load() -> dict:    
+    path = _resolve_store_path()
+    #print(f"_CONVO_STORE : {path}")
+    
+    try:
+        if _is_gs_path(path):
+            raw = _gcs_read_text(path)
+            db = json.loads(raw)
+        else:
+            with open(path, "r", encoding="utf-8") as f:
+                db = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        print(f"[JSON-LOAD] {path} 없음/비어있음 → 새 DB 구조 생성")
+        db = {"version": 1, "sessions": {}}
+
+    # list → dict 마이그레이션 유지
+    sess = db.get("sessions")
+    if isinstance(sess, list):
+        new_sessions = {}
+        for s in sess:
+            sid = (s.get("meta") or {}).get("session_id") or s.get("id") or f"migrated_{len(new_sessions)+1}"
+            new_sessions[sid] = s
+        db["sessions"] = new_sessions
+    if "sessions" not in db or not isinstance(db["sessions"], dict):
+        db["sessions"] = {}
+    return db
+
+
+def _db_save(db: dict) -> None:
+    path = _resolve_store_path()
+    payload = json.dumps(db, ensure_ascii=False, indent=2)
+    #print(f"path : {path}, payload : {payload}") // payload: 모든 대화내용 출력 , path :  gs://chatsaju-5cd67-convos/conversations.json
+    if _is_gs_path(path):
+        _gcs_write_text(path, payload)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload)
+
+    # 진단용: 총 턴 수 출력
+    sessions = db.get("sessions", {})
+    turns = 0
+    if isinstance(sessions, dict):
+        for s in sessions.values():
+            turns += len(s.get("turns", []))
+    print(f"[JSON-SAVE] {path} 저장 완료 (세션 수: {len(sessions)}, 총 턴 수: {turns})")
+    
+    
+
+def _norm(s: str) -> str:
+    return (s or "").casefold()
+
+
+def search_messages(
+    *,
+    query: str | None = None,
+    keywords: list[str] | None = None,
+    keyword_match: str = "any",     # "any" | "all"
+    date: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    target_date: str | None = None,
+    session_id: str | None = None,
+    role: str | None = None,
+    mode: str | None = None,
+    has_target: bool | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> Tuple[list[dict], int]:
+    """
+    conversations.json 전체에서 조건으로 필터링하여 최신순 반환.
+    - sessions가 dict(권장) 이든 list(과거 포맷) 이든 모두 지원
+    return: (rows, total_count)
+    """
+    db = _db_load()
+    rows: list[dict] = []
+
+    # --- 입력 정규화 ---
+    q = _norm(query) if query else None
+    kwset = set((k or "").strip() for k in (keywords or []) if k and k.strip())
+
+    sessions = db.get("sessions", {})
+    # sessions가 list일 수도 있으므로 이터레이터 통일
+    def _iter_sessions():
+        if isinstance(sessions, dict):
+            for sid, sess in sessions.items():
+                yield sid, sess
+        elif isinstance(sessions, list):
+            for sess in sessions:
+                sid = (sess.get("meta", {}) or {}).get("session_id") or sess.get("id") or "unknown"
+                yield sid, sess
+        else:
+            return
+
+    for sid, sess in _iter_sessions():
+        if session_id and sid != session_id:
+            continue
+
+        turns = sess.get("turns", []) or []
+        for turn in turns:
+            # --- 공통 필터 ---
+            if role and turn.get("role") != role:
+                continue
+            if mode and turn.get("mode") != mode:
+                continue
+            if date and turn.get("date") != date:
+                continue
+            if date_from and (turn.get("date", "") < date_from):
+                continue
+            if date_to and (turn.get("date", "") > date_to):
+                continue
+            if target_date and turn.get("target_date") != target_date:
+                continue
+            if has_target is True and not turn.get("target_date"):
+                continue
+            if has_target is False and turn.get("target_date"):
+                continue
+
+            # --- 키워드 필터(msg_keywords) ---
+            msgs_kw = turn.get("msg_keywords") or []
+            # 혹시 문자열로 저장된 경우 방어
+            if isinstance(msgs_kw, str):
+                msgs_kw = [msgs_kw]
+            if kwset:
+                msg_kw_set = set(msgs_kw)
+                if keyword_match == "all":
+                    if not kwset.issubset(msg_kw_set):
+                        continue
+                else:  # "any"
+                    if kwset.isdisjoint(msg_kw_set):
+                        continue
+
+            # --- 자유 텍스트 필터(본문/요약/키워드 포함) ---
+            if q:
+                hay = " ".join([
+                    _norm(turn.get("text", "")),
+                    _norm(turn.get("notes", "")),
+                    _norm(" ".join(msgs_kw)),
+                ])
+                if q not in hay:
+                    continue
+
+            # 매치된 항목 수집 (+ 세션 id 주입)
+            row = dict(turn)
+            row["_session_id"] = sid
+            rows.append(row)
+
+    # --- 정렬: ts(ISO) 우선, 없으면 date+time 사용 ---
+    def _key(t: dict):
+        ts = t.get("ts")
+        if ts:
+            return ts
+        return f"{t.get('date','')}T{t.get('time','')}+0000"
+
+    rows.sort(key=_key, reverse=True)
+
+    total = len(rows)
+    start = max(0, int(offset))
+    end = start + max(0, int(limit))
+    sliced = rows[start:end]
+
+    #print(f"[SEARCH] total={total}, offset={offset}, limit={limit}, returned={len(sliced)}")
+    return sliced, total
+
+  
+# ---- JSON 저장소 유틸 ----
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+_CONVO_STORE = os.path.join(CURRENT_DIR, "conversations.json")
+
+def _now_utc_iso() -> str: 
+    """현재 UTC 시각을 ISO 문자열로"""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def _local_date() -> str:
+    """로컬 날짜 YYYY-MM-DD"""
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+def _local_time() -> str:
+    """로컬 시간 HH:MM"""
+    return time.strftime("%H:%M", time.localtime())
+
+def _local_ts() -> str:
+    """로컬 타임스탬프 YYYY-MM-DDTHH:MM:SS+TZ"""
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+
+def record_turn_message(
+    session_id: str,
+    role: str,
+    text: str,
+    *,
+    mode: str = "GEN",
+    auto_meta: bool = True,
+    extra_meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    한 턴(메시지)을 JSON DB에 기록.
+    - auto_meta=True: OpenAI로 메타 자동 추출
+    - extra_meta: 간지 등 추가 필드를 dict로 전달하면 turn에 합쳐 저장
+    """
+    db = _db_load()
+    if session_id not in db["sessions"]:
+        print(f"[WARN] 세션 {session_id} 없음 → 자동 생성")
+        db["sessions"][session_id] = {
+            "meta": {"session_id": session_id, "created_at": _now_utc_iso(), "title": "사주 대화"},
+            "turns": []
+        }
+
+    turn = {
+        "ts": _local_ts(),
+        "date": _local_date(),
+        "time": _local_time(),
+        "role": role,
+        "mode": mode,
+        "text": text,
+    }
+
+    if auto_meta:
+        meta = _extract_meta(text)
+        #print(f"[META] 자동추출: {meta}")
+        if meta.get("msg_keywords"): turn["msg_keywords"] = meta["msg_keywords"]
+        if meta.get("target_date"):  turn["target_date"]  = meta["target_date"]
+        if meta.get("time"):         turn["event_time"]   = meta["time"]
+        if meta.get("kind"):         turn["kind"]         = meta["kind"]
+        if meta.get("notes"):        turn["notes"]        = meta["notes"]
+
+    if extra_meta:
+        for k, v in extra_meta.items():
+            if v is not None:
+                turn[k] = v
+        print(f"[META-EXTRA] 추가 메타: {extra_meta}")
+
+    db["sessions"][session_id]["turns"].append(turn)
+    _db_save(db)
+    print(f"[TURN] 저장 완료: session={session_id}, role={role}")
+# ================== /JSON 저장 유틸 ==================
+
+
+def ensure_session(sid: str, title: str = "사주 대화") -> str:
+    """세션이 없으면 생성, 있으면 사용"""
+    db = _db_load()
+    if not isinstance(db.get("sessions"), dict):
+        db["sessions"] = {}  # 방어
+    if sid not in db["sessions"]:
+        db["sessions"][sid] = {
+            "meta": {"session_id": sid, "created_at": _now_utc_iso(), "title": title},
+            "turns": []
+        }
+        _db_save(db)
+        print(f"[SESSION] 새 세션 생성: {sid}")
+    return sid
