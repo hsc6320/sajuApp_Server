@@ -4,7 +4,7 @@ import logging
 import os
 import json 
 from dotenv import load_dotenv
-from regress_conversation import _db_load, ensure_session, record_turn_message, get_extract_chain, build_question_with_regression_context
+from regress_conversation import ISO_DATE_RE, KOR_ABS_DATE_RE, _db_load, _maybe_override_target_date, _today, ensure_session, record_turn_message, get_extract_chain, build_question_with_regression_context
 from converting_time import extract_target_ganji_v2, convert_relative_time
 from regress_Deixis import _make_bridge, build_regression_and_deixis_context
 from sip_e_un_sung import unseong_for, branch_for, pillars_unseong, seun_unseong
@@ -690,46 +690,172 @@ def is_fortune_query(text: str) -> bool:
     t = (text or "").strip()
     return any(k in t for k in FORTUNE_KEYS)
 
-# 🔎 "회귀 의도" 감지 (예: "다시", "지난번", "그때", "전에")
-def looks_like_regression(text: str) -> bool:
-    return any(kw in text for kw in ["다시", "지난번", "그때", "전에"])
 
-# --- (B) 메타 추출 및 시간 변환 로직 함수 ---
-def _extract_and_convert(question: str):
+# #--- (B) 메타 추출 및 시간 변환 로직 함수 ---
+# def extract_meta_and_convert(question: str):
+#     """
+#     질문에서 메타데이터를 추출하고 상대적 시간을 절대 시간으로 변환합니다.
+#     """
+#     extract_chain = get_extract_chain()
+#     if not extract_chain:
+#         print("[META] skip: OPENAI_API_KEY not set")
+#         return {}
+
+#     try:
+#         ext_res = extract_chain.invoke({"text": question})
+#         raw = ext_res.content if hasattr(ext_res, "content") else str(ext_res)
+#         print(f"ext_res : {ext_res}")
+#         parsed = json.loads(raw)
+#         print(f"parsed : {parsed}")
+#     except Exception as e:
+#         print(f"🔎 메타 추출/파싱 실패: {type(e).__name__}: {e}")
+#         return {}
+    
+#     # 상대적 시간 → 절대 시간 변환
+#     print(f"상대적 시간{datetime.now().year}/ {datetime.now().month}/ {datetime.now().day}")
+#     try:
+#         absolute_keywords, updated_question = convert_relative_time(
+#             question,  parsed["msg_keywords"], datetime.now().year, datetime.now().month, datetime.now().day
+#         )
+#         #print(f"🟡 변환된 키워드: {absolute_keywords}")
+#         print(f"🟡 갱신된 질문: {updated_question}")
+#         parsed["absolute_keywords"] = absolute_keywords
+#         parsed["updated_question"] = updated_question
+        
+#     except Exception as e:
+#         return {}
+#         print(f"❌ 시간 변환 실패: {e}")
+    
+#     return parsed
+
+
+
+# def extract_meta_and_convert(question: str):
+#     """메타 추출 + (검증된) 상대시간 → 절대/간지 치환"""
+#     extract_chain = get_extract_chain()
+#     if not extract_chain:
+#         print("[META] skip: OPENAI_API_KEY not set")
+#         # 최소 스켈레톤 반환
+#         return {"msg_keywords": [], "target_date": None, "time": None, "kind": None, "notes": ""}, question
+
+#     try:
+#         ext_res = extract_chain.invoke({"text": question})
+#         raw = ext_res.content if hasattr(ext_res, "content") else str(ext_res)
+#         parsed = json.loads(raw)
+#     except Exception as e:
+#         print(f"[META] LLM 파싱 실패: {e}")
+#         parsed = {"msg_keywords": [], "target_date": None, "time": None, "kind": None, "notes": ""}
+
+#     # 누락키 보정
+#     parsed.setdefault("msg_keywords", [])
+#     parsed.setdefault("target_date", None)
+#     parsed.setdefault("time", None)
+#     parsed.setdefault("kind", None)
+#     parsed.setdefault("notes", "")
+#     print(f"msg_keywords : {parsed["msg_keywords"]}")
+#     print(f"target_date : {parsed["target_date"]}")
+    
+#     # === 핵심: 검증된 기존 함수 호출 (변경 금지) ===
+#     try:
+#         abs_kws, updated_q = convert_relative_time(
+#             question,
+#             parsed.get("msg_keywords", []),
+#             datetime.now().year, datetime.now().month, datetime.now().day,
+#         )
+#         parsed["absolute_keywords"] = abs_kws
+#         parsed["updated_question"]  = updated_q        
+#     except Exception as e:
+#         print(f"[CRT] 예외(무시): {e}")
+#         parsed["absolute_keywords"] = parsed.get("msg_keywords", [])
+#         parsed["updated_question"]  = question
+
+#     return parsed, parsed["updated_question"]
+
+
+# # --- (B) 메타 추출 및 시간 변환 로직 함수 ---
+def extract_meta_and_convert(question: str) -> tuple[dict, str]:
+    """메타 추출 + (프롬프트는 그대로) 상대시간 → 절대/간지 치환까지 한 번에.
+    반환: (parsed_meta(dict), updated_question(str))
     """
-    질문에서 메타데이터를 추출하고 상대적 시간을 절대 시간으로 변환합니다.
-    """
+    # 1) LLM 메타 추출
+    parsed: dict = {}
     extract_chain = get_extract_chain()
     if not extract_chain:
         print("[META] skip: OPENAI_API_KEY not set")
-        return {}
+        parsed = {}
+    else:
+        try:
+            ext_res = extract_chain.invoke({"text": question})
+            raw = ext_res.content if hasattr(ext_res, "content") else str(ext_res)
+            parsed = json.loads(raw)
+            print(f"[META] JSON 파싱 성공: {parsed}")
+        except Exception as e:
+            print(f"[META] 예외 → 빈 메타 사용: {e}")
+            parsed = {}
 
-    try:
-        ext_res = extract_chain.invoke({"text": question})
-        raw = ext_res.content if hasattr(ext_res, "content") else str(ext_res)
-        print(f"ext_res : {ext_res}")
-        parsed = json.loads(raw)
-        print(f"parsed : {parsed}")
-    except Exception as e:
-        print(f"🔎 메타 추출/파싱 실패: {type(e).__name__}: {e}")
-        return {}
+    # 2) 누락 보정
+    parsed.setdefault("msg_keywords", [])
+    parsed.setdefault("target_date", None)
+    parsed.setdefault("time", None)
+    parsed.setdefault("kind", None)
+    parsed.setdefault("notes", "")
+    parsed.setdefault("_facts", {})
+
+    # 3) target_date 보강(프롬프트 수정 없이 여기서만 처리)
+    #    - LLM이 넣어주면 그대로 둠
+    #    - 없으면 질문에서 ISO 또는 한글 절대일 추출
+    if not parsed["target_date"]:
+        m_iso = ISO_DATE_RE.search(question)
+        if m_iso:
+            parsed["target_date"] = m_iso.group(0)
+            parsed["_facts"]["deixis_anchor_date"] = {
+                "value": parsed["target_date"], "source": "iso_in_text"
+            }
+            print(f"[DEIXIS] ISO 날짜 감지 → target_date={parsed['target_date']}")
+        else:
+            now = _today()
+            print(f"[TIME] today={now.isoformat()}")
+            m_kor = KOR_ABS_DATE_RE.search(question)
+            if m_kor:
+                mm, dd = int(m_kor.group(1)), int(m_kor.group(2))
+                # 연도 추정은 필요한 정책으로 보강하세요(올해 기준 등)
+                yyyy = now.year
+                try:
+                    parsed["target_date"] = date(yyyy, mm, dd).isoformat()
+                    parsed["_facts"]["deixis_anchor_date"] = {
+                        "value": parsed["target_date"], "source": "korean_abs"
+                    }
+                    print(f"[DEIXIS] 한글 절대일 감지 → target_date={parsed['target_date']}")
+                except Exception as e:
+                    print(f"[DEIXIS] 한글 절대일 보정 실패: {e}")
+
+    # 4) 상대시간 치환: expressions에 **항상 질문 원문을 포함**
+    #    (이 한 줄이 핵심입니다)
+    today = _today()
+    cy, cm, cd = today.year, today.month, today.day
+    # msg_keywords + 질문 원문(중복 제거)
+    expressions = list(dict.fromkeys((parsed.get("msg_keywords") or []) + [question]))
+    _maybe_override_target_date(question, parsed, today)
     
-    # 상대적 시간 → 절대 시간 변환
-    print(f"상대적 시간{datetime.now().year}/ {datetime.now().month}/ {datetime.now().day}")
+    
     try:
-        absolute_keywords, updated_question = convert_relative_time(
-            question,  parsed["msg_keywords"], datetime.now().year, datetime.now().month, datetime.now().day
+        abs_kws, updated_q = convert_relative_time(
+            question=question,
+            expressions=expressions,   # ← 여기!
+            current_year=cy,
+            current_month=cm,
+            current_day=cd,
         )
-        #print(f"🟡 변환된 키워드: {absolute_keywords}")
-        print(f"🟡 갱신된 질문: {updated_question}")
-        parsed["absolute_keywords"] = absolute_keywords
-        parsed["updated_question"] = updated_question
-        
     except Exception as e:
-        return {}
-        print(f"❌ 시간 변환 실패: {e}")
+        print(f"[CRT] convert_relative_time 예외: {e}")
+        abs_kws, updated_q = (parsed.get("msg_keywords") or []), question
+
+    parsed["absolute_keywords"] = abs_kws
+    parsed["updated_question"] = updated_q
     
-    return parsed
+    return parsed, updated_q
+
+
 
 # 5. Firebase 함수 엔드포인트
 @https_fn.on_request(memory=2048, timeout_sec=60)
@@ -781,13 +907,21 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         # print(result)
         
         # 2. 메타 추출 및 시간 변환: 재사용 가능한 함수로 분리
-        parsed_meta = _extract_and_convert(question)
-        updated_question = parsed_meta.get("updated_question", question) #"updated_question" 값이 없다면 원래 질문 "question"을 리턴함
+        #parsed_meta = extract_meta_and_convert(question)
+        #updated_question = parsed_meta.get("updated_question", question) #"updated_question" 값이 없다면 원래 질문 "question"을 리턴함
+        
+        # 2. 메타 추출 및 시간 변환
+        parsed_meta, updated_question = extract_meta_and_convert(question)  # ✔ 튜플 언팩
+
+        # updated_question이 비어오면 안전하게 원문으로 폴백
+        updated_question = updated_question or parsed_meta.get("updated_question") or question
+
+        print(f"[CRT] abs={parsed_meta.get('absolute_keywords')} / updated='{updated_question}'")
         
 
-        print(f"🧑 이름: {user_name}, 🌿 간지: {sajuganji}, 📊 대운: {daewoon}, 현재: {current_daewoon}")
-        print(f"십성정보 : 년간 {yearGan}/{yearJi} 월간{wolGan}/{wolJi} 대운{currDaewoonGan}/{currDaewoonJi}")
-        print(f"년주: {year} 월주: {month}")
+        #print(f"🧑 이름: {user_name}, 🌿 간지: {sajuganji}, 📊 대운: {daewoon}, 현재: {current_daewoon}")
+        #print(f"십성정보 : 년간 {yearGan}/{yearJi} 월간{wolGan}/{wolJi} 대운{currDaewoonGan}/{currDaewoonJi}")
+        #print(f"년주: {year} 월주: {month}")
         #print(f"❓ 질문: {question} {updated_question}")
         
         {
@@ -853,7 +987,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         #summary_text = global_memory.moving_summary_buffer or ""
         summary_text = get_summary_text()
         summary_text = get_session_brief_summary(session_id)
-        print(f"summary_text : {summary_text}")
+        #print(f"summary_text : {summary_text}")
         
         
         # --- 회귀(이전 대화 회수) ---
@@ -1061,10 +1195,11 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             )
             
             # 회귀 빌더에서 만든 질문(맥락 포함) 사용; 없으면 updated_question
-            effective_question = updated_question
+            effective_question = (question_for_llm or parsed_meta.get("updated_question") or updated_question or question)
             bridge_text = _make_bridge(reg_dbg.get("facts", {}))
             facts_json   = json.dumps(reg_dbg.get("facts", {}), ensure_ascii=False)
             
+            {
             # result = chat_with_memory.invoke(
             #     {
             #        # "user_payload": json.dumps(user_payload, ensure_ascii=False),
@@ -1076,7 +1211,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             #     },
             #     config={"configurable": {"session_id": session_id}},
             # )
-            
+            }
             result = chat_with_memory.invoke(
                 {
                     "context": reg_prompt,                              # 회귀/컨텍스트 전문

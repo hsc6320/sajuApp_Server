@@ -13,7 +13,7 @@ from langchain_core.prompts import ChatPromptTemplate
 #from __future__ import annotations
 from typing import Any, Dict, List, Tuple, Optional
 import os, re, json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from langchain_openai import ChatOpenAI
 try:
     from zoneinfo import ZoneInfo  # Py3.9+
@@ -372,8 +372,7 @@ def _extract_meta(text: str) -> Dict[str, Any]:
     OpenAI로 msg_keywords/target_date/time/kind/notes 추출.
     - get_extract_chain()은 JSON 응답(response_format=json_object) 강제된 체인이어야 함.
     - 키가 빠져도 기본값 세팅.
-    """
-    print(f"regress_conversations\n[META] 입력 문장: {text}")
+    """    
     data = {}
 
     try:
@@ -860,7 +859,6 @@ def record_turn_message(
 
     db["sessions"][session_id]["turns"].append(turn)
     _db_save(db)
-    print(f"[TURN] 저장 완료: session={session_id}, role={role}")
 # ================== /JSON 저장 유틸 ==================
 
 
@@ -883,15 +881,33 @@ def ensure_session(sid: str, title: str = "사주 대화") -> str:
 import re
 from datetime import datetime, timedelta, timezone
 
+# yyyy-mm-dd (ISO)
 ISO_DATE_RE = re.compile(r"\b(19|20)\d{2}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b")
-KOR_ABS_DATE_RE = re.compile(r"(내년|작년)?\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일")
 
-# 상대시간 토큰(필요한 것만; 과감히 좁게)
-RELATIVE_OFFSETS = {
+# (내후년|내년|올해|작년|재작년)? 10월 4일  → year는 지시어 기준으로 해석
+KOR_ABS_DATE_RE = re.compile(
+    r"(내후년|내년|올해|작년|재작년)?\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일"
+)
+
+# 상대 '일' 단위
+RELATIVE_DAY_TOKENS = {
+    "오늘": 0,
     "내일": 1,
+    "내일모레": 2,   # 붙여쓴 형태
+    "내일 모레": 2,  # 띄어쓴 형태
     "모레": 2,
+    "글피": 3,
     "어제": -1,
     "그저께": -2,
+}
+
+# 상대 '년' 지시어 (월/일이 함께 올 때만 실제 날짜 산출에 사용)
+RELATIVE_YEAR_TOKENS = {
+    "올해": 0,
+    "내년": 1,
+    "내후년": 2,
+    "작년": -1,
+    "재작년": -2,
 }
 
 def _now_kr():
@@ -911,95 +927,33 @@ def _to_text(raw):
     if hasattr(raw, "content"): return raw.content
     if isinstance(raw, str): return raw
     return str(raw)
-
-def _resolve_absolute_date_from_korean(text: str, now: datetime) -> str | None:
+    
+def _today() -> date:
     """
-    '10월 4일', '내년 10월 4일', '작년 10월 4일' → YYYY-MM-DD
-    (연도 생략 시 올해 기준. '내년/작년' 접두어만 지원)
-    추정 규칙을 넓히고 싶으면 여기서만 확장.
+    '내일/모레' 같은 상대표현을 정확히 계산하려면 기준 날짜가 중요함.
+    - Cloud Run/Functions가 UTC라면 KST(+09:00)로 보정하는 게 보통 기대와 일치.
+    - 환경이 이미 KST라면 use_kst=False로 바꿔도 됨.
     """
-    m = KOR_ABS_DATE_RE.search(text)
-    if not m:
-        return None
-    year_hint, mm, dd = m.groups()
-    y = now.year
-    if year_hint == "내년":
-        y += 1
-    elif year_hint == "작년":
-        y -= 1
-    try:
-        dt = datetime(y, int(mm), int(dd), tzinfo=now.tzinfo)
-        return dt.strftime("%Y-%m-%d")
-    except ValueError:
-        return None
+    return datetime.now(timezone(timedelta(hours=9))).date()  # 필요에 맞게 조정
 
-def _resolve_relative_date(text: str, now: datetime) -> tuple[str | None, str | None]:
-    """
-    상대시간을 절대일로 계산. (내일/모레/어제/그저께만 엄격 지원)
-    반환: (yyyy-mm-dd | None, matched_token | None)
-    """
-    for tok, days in RELATIVE_OFFSETS.items():
-        if tok in text:
-            dt = (now + timedelta(days=days)).date()
-            return dt.strftime("%Y-%m-%d"), tok
-    return None, None
 
-def extract_meta_and_resolve(question: str, extract_chain) -> dict:
-    """
-    1) 기존 프롬프트로 LLM 메타 추출
-    2) LLM이 임의로 넣은 target_date는 '무시'하고, 코드에서 다음 순서로 채움:
-       (a) 문장 내 ISO 날짜(YYYY-MM-DD) → 그대로 채움
-       (b) 한국어 절대일('10월 4일', '내년 10월 4일', '작년 10월 4일') → 변환해 채움
-       (c) 상대시간(내일/모레/어제/그저께) → now 기준으로 계산해 채움
-       (d) 없으면 None
-    """
-    print(f"[META] 입력 문장: {question}")
-    meta = {}
-    try:
-        llm_res = extract_chain.invoke({"text": question})
-        raw = _to_text(llm_res)
-        meta = _safe_json_loads(raw) or {}
-        print(f"[META] LLM 원본 파싱: {meta}")
-    except Exception as e:
-        print(f"[META] LLM 추출 실패 → 빈 메타 사용: {e}")
-        meta = {}
+def _maybe_override_target_date(question: str, parsed: dict, now: date) -> None:
+    # 이미 ISO yyyy-mm-dd 라면 유지
+    td = parsed.get("target_date")
+    def _bad(td: str) -> bool:
+        # 과거 3년보다 지나치게 멀거나(LLM 헛발), 포맷 비정상 → 덮어씀
+        try:
+            d = date.fromisoformat(td)
+            return (d < now.replace(year=now.year-3)) or (d > now.replace(year=now.year+4))
+        except Exception:
+            return True
 
-    # 기본 필드 보정
-    meta.setdefault("msg_keywords", [])
-    meta.setdefault("target_date", None)
-    meta.setdefault("time", None)
-    meta.setdefault("kind", None)
-    meta.setdefault("notes", "")
-
-    # ⚠️ LLM이 넣은 target_date는 신뢰하지 않음 → 무시하고 다시 계산
-    meta["target_date"] = None
-
-    now = _now_kr()
-
-    # 1) ISO-8601가 문장에 '명시'된 경우 우선
-    m = ISO_DATE_RE.search(question)
-    if m:
-        meta["target_date"] = m.group(0)
-        print(f"[META] ISO 날짜 감지 → target_date={meta['target_date']}")
-        return meta
-
-    # 2) 한국어 절대일(연도 생략 가능) 처리
-    kor_abs = _resolve_absolute_date_from_korean(question, now)
-    if kor_abs:
-        meta["target_date"] = kor_abs
-        print(f"[META] 한글 절대일 변환 → target_date={meta['target_date']}")
-        return meta
-
-    # 3) 상대시간(내일/모레/…) → now 기준 변환
-    rel_date, tok = _resolve_relative_date(question, now)
-    if rel_date:
-        meta["target_date"] = rel_date
-        # 회귀/지시적 대명사 처리용 앵커도 남겨두면 좋음
-        meta.setdefault("_facts", {})["deixis_anchor_date"] = {
-            "value": rel_date,
-            "source": f"relative::{tok}",
-        }
-        print(f"[META] 상대시간 '{tok}' 해석 → target_date={rel_date}")
-
-    # 여기서 장소/인물 등도 파싱하고 싶으면 meta["_facts"]에 추가
-    return meta
+    # 상대 토큰이 포함되면 우선순위 높게 덮어씀
+    for tok, off in RELATIVE_DAY_TOKENS.items():
+        if tok in question:
+            newd = (now + timedelta(days=off)).isoformat()
+            if not td or _bad(td):
+                parsed["target_date"] = newd
+                parsed.setdefault("_facts", {})["deixis_anchor_date"] = {"value": newd, "source": f"relative:{tok}"}
+                print(f"[DEIXIS][TIME] '{tok}' → target_date={newd}")
+            break

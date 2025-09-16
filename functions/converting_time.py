@@ -9,7 +9,6 @@ from ganji_converter import get_wolju_from_date, get_year_ganji_from_json, get_i
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 JSON_PATH = os.path.join(CURRENT_DIR, "converted.json")
 
-import re
 from datetime import datetime, timedelta
 
 K_NUM = {
@@ -164,6 +163,7 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
     absolute_expressions = []
     relative_to_ganji_map = {}  # 👈 상대 표현 → 간지
     context_year = None
+    print(f"convert_relative_time() question: {question}, expressions : {expressions}")
 
 
     #for item in expressions:
@@ -277,7 +277,7 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
             if month_match := re.search(r"\d{1,2}월", item):
                 absolute_expressions.append(month_match.group())
         
-        elif (m2 := re.search(r"(?<!\d)(\d{2})\s*년\s*년도\b", item)):
+        elif (m2 := re.search(r"(?<!\d)(\d{2})\s*년\b", item)):
             token_2digit = m2.group(0)                  # 실제 매칭된 원문: '24년' or '24 년'
             year_suffix = int(m2.group(1))
 
@@ -359,7 +359,8 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
 
         # === 그 외 ===
         else:
-            absolute_expressions.append(item)
+            if item != question and " " not in item:
+                absolute_expressions.append(item)
 
     # ===== 루프 종료 후: 월 누락 보정 =====
     # expressions 추출 단계에서 월을 못 잡은 경우를 대비해 question 전체에서 한 번 더 시도
