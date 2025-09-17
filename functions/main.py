@@ -4,6 +4,7 @@ import logging
 import os
 import json 
 from dotenv import load_dotenv
+from conv_store import set_current_user_context
 from regress_conversation import ISO_DATE_RE, KOR_ABS_DATE_RE, _db_load, _maybe_override_target_date, _today, ensure_session, record_turn_message, get_extract_chain, build_question_with_regression_context
 from converting_time import extract_target_ganji_v2, convert_relative_time
 from regress_Deixis import _make_bridge, build_regression_and_deixis_context
@@ -100,127 +101,6 @@ from langchain.memory import ConversationSummaryBufferMemory, ChatMessageHistory
 from langchain_openai import ChatOpenAI
 from langchain.chains import LLMChain
 from google.cloud import storage
-
-
-# 3. Prompt 정의 (수정 필요!)
-# SystemMessage에서는 이제 current_summary를 직접 넣지 않습니다.
-# MessagesPlaceholder("history")가 요약된 기록을 포함하여 제공할 것입니다.
-# base_system_prompt_template = """
-
-# 너는 사주명리학과 초씨역림에 정통한 지혜로운 조언가다.
-# 말투는 부드럽고 현실감 있게, 사람처럼 감정을 담아 표현해. (GPT스러움 금지)
-
-# [역할 분류 규칙]
-# 1. 질문이 모호/단순(“운세 봐줘”, “올해 어때?”) → 제공된 사주 정보만 활용
-#    - 절대 새로운 간지/대운/세운 계산 금지
-# 2. 말투는 따뜻한 친구처럼. 형식적/전문용어 남발 금지.
-
-# [금지 규칙]
-# - {user_name}, {sajuganji}, {daewoon}, {current_daewoon} 등의 새로운 간지/대운 생성 금지
-# - 내부 추론으로 재해석·변경 금지
-
-# [사주 데이터]
-# - 이름: {user_name}
-# - 간지: {sajuganji}
-# - 대운 흐름: {daewoon}
-# - 현재 대운: {current_daewoon}
-
-# ▶ 십성 판단 참고 정보:
-# - 음양: {yinYang}
-# - 기준 오행: {fiveElement}
-# - 년간: {yearGan}
-# - 년지: {yearJi}
-# - 월간: {wolGan}
-# - 월지: {wolJi}
-# - 일간: {ilGan}
-# - 일지: {ilJi}
-# - 시간: {siGan}
-# - 시지: {siJi}
-# - 현재 대운 천간: {currDaewoonGan}
-# - 현재 대운 지지: {currDaewoonJi}
-
-# [십성 해석 원칙]
-# - 반드시 일간(日干)을 중심으로 분류
-# - 주제(재물, 연애, 직업, 인간관계, 성향)에 맞는 십신을 우선
-# - 부족/중첩 → 강약·흐름·조화로 보정
-
-# [출력 형식]
-# ▶ 사주 해석:
-# - 사주 요약: 질문자 사주 구조 요약
-# - 대운 흐름: 제공된 대운 기반 요약
-# - 해석: 질문 관련 십신 중심 분석
-# - 조언: 실질적 제안/긍정적 메시지
-
-# 대화 요약:
-# {summary}
-
-# """
-# # [비견] 나와 성향이 같은 존재 → 주체성, 독립성  
-# # [겁재] 나와 비슷하나 음양이 다른 → 경쟁, 자존심, 손재수  
-# # [식신] 내가 생하는 기운 (동일 음양) → 표현력, 창의성, 자녀  
-# # [상관] 내가 생하는 기운 (다른 음양) → 직설적, 재능, 저항  
-# # [정재/편재] 내가 극하는 오행 → 소유, 재물, 현실, 수입  
-# # [정관/칠살] 나를 극하는 오행 → 사회적 책임, 직업, 긴장감  
-# # [정인/편인] 나를 생하는 오행 → 보호, 안정, 지식, 귀인
-# prompt = ChatPromptTemplate.from_messages([
-#     SystemMessage(content=base_system_prompt_template), # 여기에 포맷팅할 변수 포함
-#     MessagesPlaceholder(variable_name="history"), # 여기에 대화 기록 (요약 포함)이 들어옵니다.
-#     ("human", "{question}")
-# ])
-# base_chain = prompt | llm
-
-
-# def build_prompt(
-#     user_name,
-#     sajuganji,
-#     daewoon,
-#     current_daewoon,
-#     summary,
-
-#     # 십성 관련 파라미터
-#     yinYang,
-#     fiveElement,
-
-#     # 간지들
-#     yearGan, yearJi,
-#     wolGan, wolJi,
-#     ilGan, ilJi,
-#     siGan, siJi,
-
-#     # 대운 간지
-#     currDaewoonGan, currDaewoonJi,
-# ):
-#     filled_system_prompt = base_system_prompt_template.format(
-#         user_name=user_name,
-#         sajuganji=sajuganji,
-#         daewoon=daewoon,
-#         current_daewoon=current_daewoon,
-#         summary=summary,
-
-#         # 십성
-#         yinYang=yinYang,
-#         fiveElement=fiveElement,
-
-#         # 간지
-#         yearGan=yearGan,
-#         yearJi=yearJi,
-#         wolGan=wolGan,
-#         wolJi=wolJi,
-#         ilGan=ilGan,
-#         ilJi=ilJi,
-#         siGan=siGan,
-#         siJi=siJi,
-
-#         # 현재 대운 간지
-#         currDaewoonGan=currDaewoonGan,
-#         currDaewoonJi=currDaewoonJi,
-#     )
-
-#     return ChatPromptTemplate.from_messages([
-#         SystemMessage(content=filled_system_prompt),
-#         MessagesPlaceholder(variable_name="history"),
-#         ("human", "{question}")
-#     ])
 
 # 1. Load API Key
 load_dotenv()
@@ -488,31 +368,8 @@ A: saju
 카테고리 (영어 단어 하나만):
 """.strip()
 )
-categoryDetail_chain = LLMChain(llm=llm, prompt=categoryDetail_prompt)
+#categoryDetail_chain = LLMChain(llm=llm, prompt=categoryDetail_prompt)
 
-
-# 3. 최종 카테고리 분류 함수 (키워드 → LLM fallback)
-# def classify_question(question: str) -> str:
-#     """
-#     사용자 질문을 'saju' | 'fortune' | 'counsel' 중 하나로 분류한다.
-#     1) keyword_category(): 규칙 기반 키워드 매칭
-#     2) category_chain.run(): LLM 기반 보조 분류
-#     """
-#     # # 1차: 키워드 기반 분류
-#     # category = keyword_category(question)
-#     # if category:
-#     #     print(f"🔍 키워드 기반 분류: {category}")
-#     #     return category
-
-#     # 2차: LLM 기반 분류
-#     category = categoryDetail_chain.invoke(question).strip().lower()
-
-#     # 안전장치: 예상 외 값이 나오면 'counsel'로 폴백
-#     if category not in ["saju", "fortune", "counsel"]:
-#         print(f"⚠️ 예상치 못한 카테고리: {category} → counsel로 폴백")
-#         return "counsel"
-
-#     return category
 
 llm2 = ChatOpenAI(temperature=0.2)
 schema = {
@@ -529,7 +386,7 @@ schema = {
     },
     "required": ["대상_시간표현"]
 }
-ext_chain = create_extraction_chain(schema=schema, llm=llm2)
+#ext_chain = create_extraction_chain(schema=schema, llm=llm2)
 
 # ✅ 전용 FACTS 요약 슬롯: global_memory.facts_summary
 def get_summary_text() -> str:
@@ -691,87 +548,6 @@ def is_fortune_query(text: str) -> bool:
     return any(k in t for k in FORTUNE_KEYS)
 
 
-# #--- (B) 메타 추출 및 시간 변환 로직 함수 ---
-# def extract_meta_and_convert(question: str):
-#     """
-#     질문에서 메타데이터를 추출하고 상대적 시간을 절대 시간으로 변환합니다.
-#     """
-#     extract_chain = get_extract_chain()
-#     if not extract_chain:
-#         print("[META] skip: OPENAI_API_KEY not set")
-#         return {}
-
-#     try:
-#         ext_res = extract_chain.invoke({"text": question})
-#         raw = ext_res.content if hasattr(ext_res, "content") else str(ext_res)
-#         print(f"ext_res : {ext_res}")
-#         parsed = json.loads(raw)
-#         print(f"parsed : {parsed}")
-#     except Exception as e:
-#         print(f"🔎 메타 추출/파싱 실패: {type(e).__name__}: {e}")
-#         return {}
-    
-#     # 상대적 시간 → 절대 시간 변환
-#     print(f"상대적 시간{datetime.now().year}/ {datetime.now().month}/ {datetime.now().day}")
-#     try:
-#         absolute_keywords, updated_question = convert_relative_time(
-#             question,  parsed["msg_keywords"], datetime.now().year, datetime.now().month, datetime.now().day
-#         )
-#         #print(f"🟡 변환된 키워드: {absolute_keywords}")
-#         print(f"🟡 갱신된 질문: {updated_question}")
-#         parsed["absolute_keywords"] = absolute_keywords
-#         parsed["updated_question"] = updated_question
-        
-#     except Exception as e:
-#         return {}
-#         print(f"❌ 시간 변환 실패: {e}")
-    
-#     return parsed
-
-
-
-# def extract_meta_and_convert(question: str):
-#     """메타 추출 + (검증된) 상대시간 → 절대/간지 치환"""
-#     extract_chain = get_extract_chain()
-#     if not extract_chain:
-#         print("[META] skip: OPENAI_API_KEY not set")
-#         # 최소 스켈레톤 반환
-#         return {"msg_keywords": [], "target_date": None, "time": None, "kind": None, "notes": ""}, question
-
-#     try:
-#         ext_res = extract_chain.invoke({"text": question})
-#         raw = ext_res.content if hasattr(ext_res, "content") else str(ext_res)
-#         parsed = json.loads(raw)
-#     except Exception as e:
-#         print(f"[META] LLM 파싱 실패: {e}")
-#         parsed = {"msg_keywords": [], "target_date": None, "time": None, "kind": None, "notes": ""}
-
-#     # 누락키 보정
-#     parsed.setdefault("msg_keywords", [])
-#     parsed.setdefault("target_date", None)
-#     parsed.setdefault("time", None)
-#     parsed.setdefault("kind", None)
-#     parsed.setdefault("notes", "")
-#     print(f"msg_keywords : {parsed["msg_keywords"]}")
-#     print(f"target_date : {parsed["target_date"]}")
-    
-#     # === 핵심: 검증된 기존 함수 호출 (변경 금지) ===
-#     try:
-#         abs_kws, updated_q = convert_relative_time(
-#             question,
-#             parsed.get("msg_keywords", []),
-#             datetime.now().year, datetime.now().month, datetime.now().day,
-#         )
-#         parsed["absolute_keywords"] = abs_kws
-#         parsed["updated_question"]  = updated_q        
-#     except Exception as e:
-#         print(f"[CRT] 예외(무시): {e}")
-#         parsed["absolute_keywords"] = parsed.get("msg_keywords", [])
-#         parsed["updated_question"]  = question
-
-#     return parsed, parsed["updated_question"]
-
-
 # # --- (B) 메타 추출 및 시간 변환 로직 함수 ---
 def extract_meta_and_convert(question: str) -> tuple[dict, str]:
     """메타 추출 + (프롬프트는 그대로) 상대시간 → 절대/간지 치환까지 한 번에.
@@ -889,23 +665,20 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         currDaewoonGan = data.get("currDaewoonGan", "") or ""
         currDaewoonJi  = data.get("currDaewoonJi", "")  or ""
         
-        # ---------- (A) 메타 추출 체인 실행 ----------
-        # 프롬프트는 가벼운 템플릿만(외부 I/O 금지)
+        # [ADD] 생년월일(YYYY-MM-DD 또는 YYYYMMDD). 앱에서 'birth' 또는 'birthday' 어느 키든 허용
+        user_birth = (data.get("birth") or data.get("birthday") or "").strip()
         
+        # [NEW] 이 요청 동안만 '해당 사용자' 파일로 라우팅되도록 켠다
+        #       (Cloud Run/Functions 재사용 프로세스 대비, 요청 끝나면 반드시 해제)
+        set_current_user_context(name=user_name, birth=user_birth)
+        _user_ctx_set = True
+        
+                
+        # ---------- (A) 메타 추출 체인 실행 ----------
+        # 프롬프트는 가벼운 템플릿만(외부 I/O 금지)       
 
         question_for_llm = None       
-            
-        # --- 추출 체인 실행(버전 의존성 방어) ---
-        # try:
-        #     ext_result = ext_chain.invoke({"input": question})
-        # except Exception as e:
-        #     print(f"🔎 ext_chain.invoke 실패: {e}")
-        #     ext_result = {}
-            
-        # result = ext_chain.run(question)
-        # print("🔎 랭체인 키워드 분류")
-        # print(result)
-        
+                    
         # 2. 메타 추출 및 시간 변환: 재사용 가능한 함수로 분리
         #parsed_meta = extract_meta_and_convert(question)
         #updated_question = parsed_meta.get("updated_question", question) #"updated_question" 값이 없다면 원래 질문 "question"을 리턴함
@@ -980,7 +753,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         # print(f"🟡 갱신된 질문: {updated_question}")
         }
         
-       # 0) 세션 먼저 보장
+        # 0) 세션 먼저 보장
         session_id = ensure_session(session_id, title="사주 대화")
 
         # ✅ 요약 텍스트 가져오기 (이미 쓰는 전역 메모리 그대로)
@@ -992,7 +765,6 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         
         # --- 회귀(이전 대화 회수) ---
         # ✅ 회귀 판단 + 맥락 결합 (키워드 리스트 따로 만들 필요 없음)
-       # question_for_llm, reg_dbg = build_question_with_regression_context(question=updated_question, summary_text=summary_text)
         reg_prompt, reg_dbg = build_regression_and_deixis_context(
                                         question=updated_question,
                                         summary_text=summary_text,
@@ -1077,12 +849,6 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                     history_messages_key="history"
                 )
 
-                # llm_body = chain.invoke({
-                #     "ben_summary":  ben_summary_txt,
-                #     "bian_summary": bian_summary_txt,
-                #     "summary":      summary_text,
-                #     "question":     updated_question,
-                # }).content.strip()
                 result = chat_with_memory.invoke(
                     {
                         "ben_summary": ben_summary_txt,
@@ -1159,6 +925,10 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             # make_saju_payload 시그니처가 4인자(absolute_keywords 포함)라면 여기에 absolute_keywords를 추가하거나,           
             user_payload = make_saju_payload(data, focus, updated_question)
 
+            # [NEW] payload에 사용자 정보가 없으면 주입
+            if "user" not in user_payload:
+                user_payload["user"] = {"name": user_name, "birth": user_birth}
+                
             #chain = saju_prompt | ChatOpenAI(
             chain = counseling_prompt | ChatOpenAI(
                 temperature=0.6, 
@@ -1178,7 +948,8 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 input_messages_key="question",
                 history_messages_key="history",
             )
-             # [중요] 대화 저장: 세션 보장
+            
+            # [중요] 사용자 메시지 기록(+메타 자동추출) — 같은 사용자 파일에 기록됨
             session_id = ensure_session(session_id, title="사주 대화")
             
             # [중요] 사용자 메시지 기록(+메타 자동추출)
@@ -1192,6 +963,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                     # 간지 결과 등 추가 필드가 있다면 여기에 붙이세요(없으면 생략)
                     # "ganji": {"year": "...", "month": "...", "day": "...", "hour": "..."}
                 },
+                payload=user_payload,
             )
             
             # 회귀 빌더에서 만든 질문(맥락 포함) 사용; 없으면 updated_question
@@ -1237,6 +1009,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 text=answer_text,
                 mode="SAJU",
                 auto_meta=False,
+                payload=user_payload,
             )
             
             return https_fn.Response(
@@ -1255,6 +1028,10 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             status=500,
             headers={"Content-Type": "application/json"}
         )
+    finally:
+        # [NEW] 이 요청 동안 켜둔 사용자 컨텍스트 해제(프로세스 재사용 대비)
+        if _user_ctx_set:
+            set_current_user_context(reset=True)
 
 # [END askSaju]
 # [END all]

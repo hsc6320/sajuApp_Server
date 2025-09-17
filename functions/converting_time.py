@@ -162,9 +162,7 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
 
     absolute_expressions = []
     relative_to_ganji_map = {}  # 👈 상대 표현 → 간지
-    context_year = None
-    print(f"convert_relative_time() question: {question}, expressions : {expressions}")
-
+    context_year = None   
 
     #for item in expressions:
     for item in sorted((str(x).strip() for x in expressions), key=len, reverse=True):

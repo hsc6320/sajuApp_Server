@@ -15,13 +15,17 @@ from typing import Any, Dict, List, Tuple, Optional
 import os, re, json
 from datetime import date, datetime, timedelta
 from langchain_openai import ChatOpenAI
+
+from conv_store import _new_db_skeleton, make_user_key, set_current_user_context, user_from_payload
 try:
     from zoneinfo import ZoneInfo  # Py3.9+
 except Exception:
     ZoneInfo = None  # 없으면 KST 변환 생략
 
 KST = ZoneInfo("Asia/Seoul") if ZoneInfo else None
-
+os.environ.setdefault("TZ", "Asia/Seoul")
+try: time.tzset()
+except: pass
 
 # (A) LLM으로 회귀 의도 판단 + 주제 추정
 _REG_PROMPT = ChatPromptTemplate.from_messages([
@@ -586,7 +590,14 @@ def build_question_with_regression_context(
 def _is_gs_path(p: str) -> bool:
     return isinstance(p, str) and p.startswith("gs://")
 
-def _resolve_store_path() -> str:    
+def _resolve_store_path() -> str:
+    """
+    [변경점]
+    - _CUR_USER_ID(현재 사용자 컨텍스트)가 설정되어 있으면
+      '그 사용자 전용 파일 경로'를 반환.
+    - 설정되지 않았으면 기존 전역(conversations.json) 경로 유지.
+    """
+    
     # 1. 환경변수 우선
     override = os.getenv("CONVO_STORE_PATH")
     if override and override.startswith("gs://"):
@@ -611,6 +622,7 @@ def _resolve_store_path() -> str:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(current_dir, "conversations.json")
     #print(f"[PATH] 로컬 경로 사용: {path}") // 모든 대화 내용 출력
+    print(f"[current_dir] : {current_dir}")
     return path
 
 
@@ -627,7 +639,7 @@ def _gcs_write_text(gs_path: str, text: str) -> None:
 
 def _db_load() -> dict:    
     path = _resolve_store_path()
-    #print(f"_CONVO_STORE : {path}")
+    print(f"_CONVO_STORE : {path}")
     
     try:
         if _is_gs_path(path):
@@ -670,7 +682,7 @@ def _db_save(db: dict) -> None:
     if isinstance(sessions, dict):
         for s in sessions.values():
             turns += len(s.get("turns", []))
-    print(f"[JSON-SAVE] {path} 저장 완료 (세션 수: {len(sessions)}, 총 턴 수: {turns})")
+    #print(f"[JSON-SAVE] {path} 저장 완료 (세션 수: {len(sessions)}, 총 턴 수: {turns})")       #저장 로그: 
     
     
 
@@ -693,101 +705,119 @@ def search_messages(
     has_target: bool | None = None,
     limit: int = 50,
     offset: int = 0,
+    user: Optional[Dict[str, Any]] = None,          # {"id","name","birth"} 직접 전달
+    payload: Optional[Dict[str, Any]] = None,       # {"user":{"name","birth"}} 형태
 ) -> Tuple[list[dict], int]:
     """
     conversations.json 전체에서 조건으로 필터링하여 최신순 반환.
     - sessions가 dict(권장) 이든 list(과거 포맷) 이든 모두 지원
     return: (rows, total_count)
+    
+    - user/payload로 사용자 컨텍스트를 임시 설정할 수 있음.
+    - 설정하지 않으면 현재 컨텍스트(_CUR_USER_ID) 또는 전역 파일에서 검색.
     """
-    db = _db_load()
-    rows: list[dict] = []
+    
+    _needs_reset = False
+    if user:
+        set_current_user_context(user=user); _needs_reset = True
+    elif payload:
+        up = user_from_payload(payload)
+        if up:
+            set_current_user_context(user=up); _needs_reset = True
+            
+    try:
+        db = _db_load()
+        rows: list[dict] = []
 
-    # --- 입력 정규화 ---
-    q = _norm(query) if query else None
-    kwset = set((k or "").strip() for k in (keywords or []) if k and k.strip())
+        # --- 입력 정규화 ---
+        q = _norm(query) if query else None
+        kwset = set((k or "").strip() for k in (keywords or []) if k and k.strip())
 
-    sessions = db.get("sessions", {})
-    # sessions가 list일 수도 있으므로 이터레이터 통일
-    def _iter_sessions():
-        if isinstance(sessions, dict):
-            for sid, sess in sessions.items():
-                yield sid, sess
-        elif isinstance(sessions, list):
-            for sess in sessions:
-                sid = (sess.get("meta", {}) or {}).get("session_id") or sess.get("id") or "unknown"
-                yield sid, sess
-        else:
-            return
+        sessions = db.get("sessions", {})
+        # sessions가 list일 수도 있으므로 이터레이터 통일
+        def _iter_sessions():
+            if isinstance(sessions, dict):
+                for sid, sess in sessions.items():
+                    yield sid, sess
+            elif isinstance(sessions, list):
+                for sess in sessions:
+                    sid = (sess.get("meta", {}) or {}).get("session_id") or sess.get("id") or "unknown"
+                    yield sid, sess
+            else:
+                return
 
-    for sid, sess in _iter_sessions():
-        if session_id and sid != session_id:
-            continue
-
-        turns = sess.get("turns", []) or []
-        for turn in turns:
-            # --- 공통 필터 ---
-            if role and turn.get("role") != role:
-                continue
-            if mode and turn.get("mode") != mode:
-                continue
-            if date and turn.get("date") != date:
-                continue
-            if date_from and (turn.get("date", "") < date_from):
-                continue
-            if date_to and (turn.get("date", "") > date_to):
-                continue
-            if target_date and turn.get("target_date") != target_date:
-                continue
-            if has_target is True and not turn.get("target_date"):
-                continue
-            if has_target is False and turn.get("target_date"):
+        for sid, sess in _iter_sessions():
+            if session_id and sid != session_id:
                 continue
 
-            # --- 키워드 필터(msg_keywords) ---
-            msgs_kw = turn.get("msg_keywords") or []
-            # 혹시 문자열로 저장된 경우 방어
-            if isinstance(msgs_kw, str):
-                msgs_kw = [msgs_kw]
-            if kwset:
-                msg_kw_set = set(msgs_kw)
-                if keyword_match == "all":
-                    if not kwset.issubset(msg_kw_set):
-                        continue
-                else:  # "any"
-                    if kwset.isdisjoint(msg_kw_set):
-                        continue
-
-            # --- 자유 텍스트 필터(본문/요약/키워드 포함) ---
-            if q:
-                hay = " ".join([
-                    _norm(turn.get("text", "")),
-                    _norm(turn.get("notes", "")),
-                    _norm(" ".join(msgs_kw)),
-                ])
-                if q not in hay:
+            turns = sess.get("turns", []) or []
+            for turn in turns:
+                # --- 공통 필터 ---
+                if role and turn.get("role") != role:
+                    continue
+                if mode and turn.get("mode") != mode:
+                    continue
+                if date and turn.get("date") != date:
+                    continue
+                if date_from and (turn.get("date", "") < date_from):
+                    continue
+                if date_to and (turn.get("date", "") > date_to):
+                    continue
+                if target_date and turn.get("target_date") != target_date:
+                    continue
+                if has_target is True and not turn.get("target_date"):
+                    continue
+                if has_target is False and turn.get("target_date"):
                     continue
 
-            # 매치된 항목 수집 (+ 세션 id 주입)
-            row = dict(turn)
-            row["_session_id"] = sid
-            rows.append(row)
+                # --- 키워드 필터(msg_keywords) ---
+                msgs_kw = turn.get("msg_keywords") or []
+                # 혹시 문자열로 저장된 경우 방어
+                if isinstance(msgs_kw, str):
+                    msgs_kw = [msgs_kw]
+                if kwset:
+                    msg_kw_set = set(msgs_kw)
+                    if keyword_match == "all":
+                        if not kwset.issubset(msg_kw_set):
+                            continue
+                    else:  # "any"
+                        if kwset.isdisjoint(msg_kw_set):
+                            continue
 
-    # --- 정렬: ts(ISO) 우선, 없으면 date+time 사용 ---
-    def _key(t: dict):
-        ts = t.get("ts")
-        if ts:
-            return ts
-        return f"{t.get('date','')}T{t.get('time','')}+0000"
+                # --- 자유 텍스트 필터(본문/요약/키워드 포함) ---
+                if q:
+                    hay = " ".join([
+                        _norm(turn.get("text", "")),
+                        _norm(turn.get("notes", "")),
+                        _norm(" ".join(msgs_kw)),
+                    ])
+                    if q not in hay:
+                        continue
 
-    rows.sort(key=_key, reverse=True)
+                # 매치된 항목 수집 (+ 세션 id 주입)
+                row = dict(turn)
+                row["_session_id"] = sid
+                rows.append(row)
 
-    total = len(rows)
-    start = max(0, int(offset))
-    end = start + max(0, int(limit))
-    sliced = rows[start:end]
+        # --- 정렬: ts(ISO) 우선, 없으면 date+time 사용 ---
+        def _key(t: dict):
+            ts = t.get("ts")
+            if ts:
+                return ts
+            return f"{t.get('date','')}T{t.get('time','')}+0000"
 
-    #print(f"[SEARCH] total={total}, offset={offset}, limit={limit}, returned={len(sliced)}")
-    return sliced, total
+        rows.sort(key=_key, reverse=True)
+
+        total = len(rows)
+        start = max(0, int(offset))
+        end = start + max(0, int(limit))
+        sliced = rows[start:end]
+
+        #print(f"[SEARCH] total={total}, offset={offset}, limit={limit}, returned={len(sliced)}")
+        return sliced, total
+    finally:
+        if _needs_reset:
+            set_current_user_context(reset=True)
 
   
 # ---- JSON 저장소 유틸 ----
@@ -819,62 +849,98 @@ def record_turn_message(
     mode: str = "GEN",
     auto_meta: bool = True,
     extra_meta: Optional[Dict[str, Any]] = None,
+    user: Optional[Dict[str, Any]] = None,      # {"id","name","birth"} 직접 전달
+    payload: Optional[Dict[str, Any]] = None,   # {"user":{"name","birth"}} 형태
 ) -> None:
     """
     한 턴(메시지)을 JSON DB에 기록.
     - auto_meta=True: OpenAI로 메타 자동 추출
     - extra_meta: 간지 등 추가 필드를 dict로 전달하면 turn에 합쳐 저장
+    
+    - user / payload 인자로 사용자 컨텍스트를 임시 설정할 수 있음.
+    - 설정하지 않으면 현재 컨텍스트(_CUR_USER_ID) 또는 전역 파일 사용.
     """
-    db = _db_load()
-    if session_id not in db["sessions"]:
-        print(f"[WARN] 세션 {session_id} 없음 → 자동 생성")
-        db["sessions"][session_id] = {
-            "meta": {"session_id": session_id, "created_at": _now_utc_iso(), "title": "사주 대화"},
-            "turns": []
+    
+    # ── [A] 사용자 컨텍스트 임시 적용 (있으면 설정, 없으면 기존 유지) ─────────────
+    _needs_reset = False
+    if user:
+        set_current_user_context(user=user); _needs_reset = True
+    elif payload:
+        up = user_from_payload(payload)
+        if up:
+            set_current_user_context(user=up); _needs_reset = True
+    try:
+        db = _db_load()
+        if session_id not in db["sessions"]:
+            print(f"[WARN] 세션 {session_id} 없음 → 자동 생성")
+            db["sessions"][session_id] = {
+                "meta": {"session_id": session_id, "created_at": _now_utc_iso(), "title": "사주 대화"},
+                "turns": []
+            }
+
+        turn = {
+            "ts": _local_ts(),
+            "date": _local_date(),
+            "time": _local_time(),
+            "role": role,
+            "mode": mode,
+            "text": text,
         }
 
-    turn = {
-        "ts": _local_ts(),
-        "date": _local_date(),
-        "time": _local_time(),
-        "role": role,
-        "mode": mode,
-        "text": text,
-    }
+        if auto_meta:
+            meta = _extract_meta(text)
+            #print(f"[META] 자동추출: {meta}")
+            if meta.get("msg_keywords"): turn["msg_keywords"] = meta["msg_keywords"]
+            if meta.get("target_date"):  turn["target_date"]  = meta["target_date"]
+            if meta.get("time"):         turn["event_time"]   = meta["time"]
+            if meta.get("kind"):         turn["kind"]         = meta["kind"]
+            if meta.get("notes"):        turn["notes"]        = meta["notes"]
 
-    if auto_meta:
-        meta = _extract_meta(text)
-        #print(f"[META] 자동추출: {meta}")
-        if meta.get("msg_keywords"): turn["msg_keywords"] = meta["msg_keywords"]
-        if meta.get("target_date"):  turn["target_date"]  = meta["target_date"]
-        if meta.get("time"):         turn["event_time"]   = meta["time"]
-        if meta.get("kind"):         turn["kind"]         = meta["kind"]
-        if meta.get("notes"):        turn["notes"]        = meta["notes"]
+        if extra_meta:
+            for k, v in extra_meta.items():
+                if v is not None:
+                    turn[k] = v
+            print(f"[META-EXTRA] 추가 메타: {extra_meta}")
 
-    if extra_meta:
-        for k, v in extra_meta.items():
-            if v is not None:
-                turn[k] = v
-        print(f"[META-EXTRA] 추가 메타: {extra_meta}")
-
-    db["sessions"][session_id]["turns"].append(turn)
-    _db_save(db)
+        db["sessions"][session_id]["turns"].append(turn)
+        _db_save(db)
+    finally:
+        # ── [C] 이 함수 내부에서 컨텍스트를 세팅했다면 끝나고 해제 ────────────────
+        if _needs_reset:
+            set_current_user_context(reset=True)
 # ================== /JSON 저장 유틸 ==================
 
-
-def ensure_session(sid: str, title: str = "사주 대화") -> str:
+def ensure_session(sid: str, title: str = "사주 대화", *, user: dict | None = None, payload: dict | None = None) -> str:
+#def ensure_session(sid: str, title: str = "사주 대화") -> str:
     """세션이 없으면 생성, 있으면 사용"""
-    db = _db_load()
-    if not isinstance(db.get("sessions"), dict):
-        db["sessions"] = {}  # 방어
-    if sid not in db["sessions"]:
-        db["sessions"][sid] = {
-            "meta": {"session_id": sid, "created_at": _now_utc_iso(), "title": title},
-            "turns": []
-        }
-        _db_save(db)
-        print(f"[SESSION] 새 세션 생성: {sid}")
-    return sid
+    
+    """
+      - user/payload로 사용자 컨텍스트를 임시 설정 가능
+      - 세션은 사용자 파일 내에 생성/확인
+    """
+    
+    _needs_reset = False
+    if user:
+        set_current_user_context(user=user); _needs_reset = True
+    elif payload:
+        up = user_from_payload(payload)
+        if up:
+            set_current_user_context(user=up); _needs_reset = True
+    try: 
+        db = _db_load()
+        if not isinstance(db.get("sessions"), dict):
+            db["sessions"] = {}  # 방어
+        if sid not in db["sessions"]:
+            db["sessions"][sid] = {
+                "meta": {"session_id": sid, "created_at": _now_utc_iso(), "title": title},
+                "turns": []
+            }
+            _db_save(db)
+            print(f"[SESSION] 새 세션 생성: {sid}")
+        return sid
+    finally:
+        if _needs_reset:
+            set_current_user_context(reset=True)
 
 
 
@@ -957,3 +1023,26 @@ def _maybe_override_target_date(question: str, parsed: dict, now: date) -> None:
                 parsed.setdefault("_facts", {})["deixis_anchor_date"] = {"value": newd, "source": f"relative:{tok}"}
                 print(f"[DEIXIS][TIME] '{tok}' → target_date={newd}")
             break
+        
+        
+def migrate_global_to_user(name: str, birth: str) -> str:
+    """
+    현재 전역 conversations.json의 내용을 '해당 사용자' 파일로 복사합니다.
+    - 이미 사용자 파일에 내용이 있으면 덮어씌웁니다.
+    - 반환: 대상 사용자 파일 경로(로컬 path 또는 gs://...)
+    """
+    # 1) 전역 DB 로드
+    global_db = _db_load()  # 현재 _CUR_USER_ID가 None이어야 전역 파일을 읽음
+
+    # 2) 사용자 컨텍스트 설정 후 skeleton으로 교체
+    uid = make_user_key(name, birth)
+    set_current_user_context(name=name, birth=birth)
+    try:
+        user_path = _resolve_store_path()  # 사용자 파일 경로
+        user_db = _new_db_skeleton()
+        user_db["sessions"] = global_db.get("sessions", {})
+        _db_save(user_db)
+        print(f"[MIGRATE] global → {user_path}")
+        return user_path
+    finally:
+        set_current_user_context(reset=True)

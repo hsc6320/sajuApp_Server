@@ -260,8 +260,8 @@ def _resolve_deixis_and_make_facts(question: str, *, session_id: str, meta_now: 
         elif anchor_place:
             val = f"{anchor_place}에서의 만남(최근 대화)"
         facts["deixis_person"] = {"value": val, "source": "inferred_from_anchor"}
-
-    print(f"[DEIXIS] facts={facts}")
+        
+    print(f"[DEIXIS] facts={facts}")        #
     return facts
 
 # ─────────────────────────────────────────────────────────────
@@ -284,13 +284,16 @@ def build_regression_and_deixis_context(
       4) 회귀=True면 JSON에서 실제 과거 턴을 스코어링하여 상위 N개 맥락 선택
       5) FACT/컨텍스트를 붙여 LLM 프롬프트 구성 (없으면 원문 그대로)
     로그 프리픽스:
-      [REG][IN]    입력/환경
-      [REG][HIST]  히스토리 상태
-      [REG][META]  메타 추출 결과
-      [REG][LLM]   LLM 회귀 판정
-      [REG][DEIX]  지시어 FACT 복원
-      [REG][SCAN]  JSON 컨텍스트 스캔/선정
-      [REG][OUT]   최종 프롬프트 요약
+        [REG][IN] : 회귀 빌더 진입 시 입력값/환경 요약(세션ID, 질문 등)
+        [REG][HIST] : 세션 히스토리 상태(과거 턴 유무/개수) → 회귀 가능 여부의 1차 게이트
+        [REG][META] : 현재 발화에서 추출한 메타(키워드, kind, 노트 등)
+        [REG][LLM] : LLM 회귀판정의 원시 결과/최종 결정(신뢰도, 이유)
+        [REG][DEIX] : 지시어(이때/그때/그곳/그 사람 등) 해석으로 복원된 FACT들(날짜/장소/만남)
+        [REG][SCAN] : JSON에서 과거 맥락 스코어링 결과(검색수, 선별수, 사용수)
+        [REG][OUT] : LLM에 넘길 최종 프롬프트(줄 수/문자 수 요약)
+        [JSON_SCAN] : 실제 conversations.json 스캔 작업의 요약(총 턴, 스코어링/픽 개수)
+        [DEIXIS][TIME] : 시간 앵커(절대 날짜) 탐색 스캔 로그
+        [DEIXIS][PLACE] : 장소 앵커(장소 키워드) 탐색 스캔 로그
     """
 
     # ─────────────────────────────────────────────────────────
@@ -305,14 +308,14 @@ def build_regression_and_deixis_context(
     # 0) 입력 확인
     print(f"[REG][IN] session_id={session_id}")
     print(f"[REG][IN] question='{_brief(question)}'")
-    print(f"[REG][IN] summary_text='{_brief(summary_text)}'")
+    #print(f"[REG][IN] summary_text='{_brief(summary_text)}'")
 
     # 1) 히스토리 게이트: 세션에 저장된 과거 턴이 없으면 회귀 불가
     hist = _get_history_stats(session_id=session_id)
-    print(f"[REG][HIST] has_history={hist.get('has_history')} turns={hist.get('history_turns')}")
+    print(f"[REG][HIST] has_history={hist.get('has_history')} turns={hist.get('history_turns')}")       #회귀 로그: [REG][HIST] has_history=True 가 떠야 함.
     if not hist.get("has_history"):
         dbg = {"llm": {"is_regression": False, "confidence": 0.0}, "reason": "first_turn_no_history"}
-        print("[REG][HIST] first turn → regression=False (hard gate)")
+    #    print("[REG][HIST] first turn → regression=False (hard gate)")
         return question, dbg
 
     # 2) 현재 발화 메타(키워드/kind/notes 등): JSON 검색 힌트로만 사용
@@ -359,7 +362,7 @@ def build_regression_and_deixis_context(
         facts = {}
     if facts:
         debug["facts"].update(facts)
-    print(f"[REG][DEIX] facts={facts if facts else '{}'}")
+    #print(f"[REG][DEIX] facts={facts if facts else '{}'}")
 
     # 5) 회귀=True면 JSON에서 실제 과거 맥락 선택
     rows_fmt: List[dict] = []
@@ -404,7 +407,7 @@ def build_regression_and_deixis_context(
         prompt = f"{body}\n\n현재 발화: {question}"
         print(f"[REG][OUT] prompt_lines={len(prompt.splitlines())} chars={len(prompt)}")
         # 프롬프트 일부 미리보기
-        print(f"[REG][OUT] preview:\n{_brief(prompt, 320)}")
+        #print(f"[REG][OUT] preview:\n{_brief(prompt, 320)}")
         return prompt, debug
 
     # 컨텍스트/FACT 아무것도 못 붙였으면 원문 그대로
