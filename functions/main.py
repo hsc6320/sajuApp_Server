@@ -1,5 +1,5 @@
 from curses import meta
-from datetime import datetime
+from datetime import date, datetime
 import logging
 import os
 import json 
@@ -636,6 +636,7 @@ def extract_meta_and_convert(question: str) -> tuple[dict, str]:
 # 5. Firebase 함수 엔드포인트
 @https_fn.on_request(memory=2048, timeout_sec=60)
 def ask_saju(req: https_fn.Request) -> https_fn.Response:
+    _ctx = False
     try:
         print("📥 요청 수신")
         data = req.get_json()       
@@ -670,8 +671,10 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         
         # [NEW] 이 요청 동안만 '해당 사용자' 파일로 라우팅되도록 켠다
         #       (Cloud Run/Functions 재사용 프로세스 대비, 요청 끝나면 반드시 해제)
+        
+        # ★ 이 줄이 ensure_session보다 먼저!
         set_current_user_context(name=user_name, birth=user_birth)
-        _user_ctx_set = True
+        _ctx = True
         
                 
         # ---------- (A) 메타 추출 체인 실행 ----------
@@ -752,7 +755,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         # print(f"변환된 키워드: {absolute_keywords}")
         # print(f"🟡 갱신된 질문: {updated_question}")
         }
-        
+          
         # 0) 세션 먼저 보장
         session_id = ensure_session(session_id, title="사주 대화")
 
@@ -1030,7 +1033,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         )
     finally:
         # [NEW] 이 요청 동안 켜둔 사용자 컨텍스트 해제(프로세스 재사용 대비)
-        if _user_ctx_set:
+       if _ctx:
             set_current_user_context(reset=True)
 
 # [END askSaju]

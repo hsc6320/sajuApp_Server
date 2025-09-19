@@ -16,7 +16,7 @@ import os, re, json
 from datetime import date, datetime, timedelta
 from langchain_openai import ChatOpenAI
 
-from conv_store import _new_db_skeleton, make_user_key, set_current_user_context, user_from_payload
+from conv_store import _CUR_USER_ID, _new_db_skeleton, _resolve_store_path_for_user, make_user_key, set_current_user_context, user_from_payload
 try:
     from zoneinfo import ZoneInfo  # Py3.9+
 except Exception:
@@ -586,6 +586,15 @@ def build_question_with_regression_context(
     # 아무 맥락도 못 붙였으면 그냥 원문 반환(디버그로 회귀 흔적만 남음)
     return question, debug
 
+from contextvars import ContextVar
+
+def _get_current_user_id() -> str | None:  
+    try:
+        uid = _CUR_USER_ID.get()
+    except LookupError:
+        uid = None
+    return (uid or "").strip() or None
+
 
 def _is_gs_path(p: str) -> bool:
     return isinstance(p, str) and p.startswith("gs://")
@@ -597,34 +606,29 @@ def _resolve_store_path() -> str:
       '그 사용자 전용 파일 경로'를 반환.
     - 설정되지 않았으면 기존 전역(conversations.json) 경로 유지.
     """
-    
-    # 1. 환경변수 우선
-    override = os.getenv("CONVO_STORE_PATH")
-    if override and override.startswith("gs://"):
-        #print(f"[PATH] 환경변수(GCS) 경로 사용: {override}")
-        return override
-
-    # 2. 컨테이너/클라우드 환경 감지
-    in_cloud = bool(
-        os.getenv("K_SERVICE") or 
-        os.getenv("FUNCTION_TARGET") or
-        os.getenv("FIREBASE_CONFIG")
-    )
-    if in_cloud:
-        # 여기에 Cloud Storage 경로를 직접 지정하거나 환경변수로 받아옵니다.
-        # 예: gs://YOUR_BUCKET_NAME/conversations.json
-        bucket_name = os.getenv("GCS_BUCKET") or 'your-project-id.appspot.com'
-        path = f"gs://{bucket_name}/conversations.json"
-        print(f"[PATH] Cloud 환경 감지 → GCS 사용: {path}")
+    #uid = _CUR_USER_ID.get()
+    uid = _get_current_user_id()
+    if uid:
+        path = _resolve_store_path_for_user(uid)
+        print(f"[PATH] user={uid} → {path}")
         return path
-
-    # 3. 로컬
+    
+    # (전역 파일로 저장하는 *레거시* 경로 — 사용자 미지정 요청 전용)
+    in_cloud = bool(os.getenv("K_SERVICE") or os.getenv("FUNCTION_TARGET") or os.getenv("FIREBASE_CONFIG"))
+    if in_cloud:
+        bucket = os.getenv("GCS_BUCKET")
+        if not bucket:
+            # 기본값('your-project-id.appspot.com') 절대 쓰지 않음
+            print(f"GCS_BUCKET = {bucket}")
+            raise RuntimeError("GCS_BUCKET not set. 예: GCS_BUCKET=chatsaju-5cd67-convos")
+        path = f"gs://{bucket}/user_id.json"
+        print(f"[PATH] (legacy global) Cloud → {path}")
+        return path
+    
     current_dir = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(current_dir, "conversations.json")
-    #print(f"[PATH] 로컬 경로 사용: {path}") // 모든 대화 내용 출력
-    print(f"[current_dir] : {current_dir}")
+    print(f"[PATH] (legacy global) Local → {path}")
     return path
-
 
 def _gcs_write_text(gs_path: str, text: str) -> None:
     bucket, name = _parse_gs_path(gs_path)
@@ -639,7 +643,7 @@ def _gcs_write_text(gs_path: str, text: str) -> None:
 
 def _db_load() -> dict:    
     path = _resolve_store_path()
-    print(f"_CONVO_STORE : {path}")
+    print(f"[PATH] {_resolve_store_path.__name__} → {path}")
     
     try:
         if _is_gs_path(path):
@@ -651,6 +655,15 @@ def _db_load() -> dict:
     except (FileNotFoundError, json.JSONDecodeError):
         print(f"[JSON-LOAD] {path} 없음/비어있음 → 새 DB 구조 생성")
         db = {"version": 1, "sessions": {}}
+        # (A) 사용자 컨텍스트가 잡혀 있으면 user 메타 주입
+        try:
+            # conv_store.set_current_user_context() 를 쓰는 구조라면:
+            uid = globals().get("_CUR_USER_ID", None)
+            um  = globals().get("_CUR_USER_META", None)
+            if uid and um:
+                db["user"] = {"id": uid, **um}
+        except Exception:
+            pass
 
     # list → dict 마이그레이션 유지
     sess = db.get("sessions")
@@ -672,9 +685,12 @@ def _db_save(db: dict) -> None:
     if _is_gs_path(path):
         _gcs_write_text(path, payload)
     else:
+        # (B) 로컬 원자적 쓰기: <file>.tmp → replace
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(payload)
+        os.replace(tmp, path)
 
     # 진단용: 총 턴 수 출력
     sessions = db.get("sessions", {})
@@ -821,8 +837,8 @@ def search_messages(
 
   
 # ---- JSON 저장소 유틸 ----
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-_CONVO_STORE = os.path.join(CURRENT_DIR, "conversations.json")
+#CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+#_CONVO_STORE = os.path.join(CURRENT_DIR, "conversations.json")
 
 def _now_utc_iso() -> str: 
     """현재 UTC 시각을 ISO 문자열로"""
