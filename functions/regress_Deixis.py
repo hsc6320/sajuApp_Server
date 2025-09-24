@@ -113,7 +113,6 @@ def _select_context_from_json(
         "filtered_by_min_sim": len(scored),  # (간단화)
         "picked": len(picked)
     }
-    print(f"[JSON_SCAN] sid={session_id} total_turns={total} scored={len(scored)} picked={len(picked)}")
     return rows_fmt, dbg
 
 # ─────────────────────────────────────────────────────────────
@@ -312,7 +311,7 @@ def build_regression_and_deixis_context(
 
     # 1) 히스토리 게이트: 세션에 저장된 과거 턴이 없으면 회귀 불가
     hist = _get_history_stats(session_id=session_id)
-    print(f"[REG][HIST] has_history={hist.get('has_history')} turns={hist.get('history_turns')}")       #회귀 로그: [REG][HIST] has_history=True 가 떠야 함.
+    #print(f"[REG][HIST] has_history={hist.get('has_history')} turns={hist.get('history_turns')}")       #회귀 로그: [REG][HIST] has_history=True 가 떠야 함.
     if not hist.get("has_history"):
         dbg = {"llm": {"is_regression": False, "confidence": 0.0}, "reason": "first_turn_no_history"}
     #    print("[REG][HIST] first turn → regression=False (hard gate)")
@@ -377,8 +376,8 @@ def build_regression_and_deixis_context(
                 session_id=session_id,
             )
             debug["search"] = {"context_used": len(rows_fmt), **dbg}
-            print(f"[REG][SCAN] context_used={len(rows_fmt)} searched_total={dbg.get('searched_total')} "
-                  f"scored={dbg.get('scored')} picked={dbg.get('picked')}")
+     #       print(f"[REG][SCAN] context_used={len(rows_fmt)} searched_total={dbg.get('searched_total')} "      //[REG][SCAN] context_used=1 searched_total=2 scored=1 picked=1
+     #             f"scored={dbg.get('scored')} picked={dbg.get('picked')}")
         except Exception as e:
             print(f"[REG][SCAN] exception in _select_context_from_json: {e}")
 
@@ -405,7 +404,7 @@ def build_regression_and_deixis_context(
     # 최종 프롬프트
     if body.strip():
         prompt = f"{body}\n\n현재 발화: {question}"
-        print(f"[REG][OUT] prompt_lines={len(prompt.splitlines())} chars={len(prompt)}")
+        #print(f"[REG][OUT] prompt_lines={len(prompt.splitlines())} chars={len(prompt)}")       //prompt_lines=4 chars=102
         # 프롬프트 일부 미리보기
         #print(f"[REG][OUT] preview:\n{_brief(prompt, 320)}")
         return prompt, debug

@@ -43,6 +43,9 @@ def _norm_stem(s):
         raise ValueError(f"Unknown stem: {s}")
 
 def _norm_branch(b):
+    if not b:
+        return None               # ✅ 널 세이프
+    
     try:
         return BRANCH_ALIASES[b]
     except KeyError:
@@ -55,6 +58,9 @@ def unseong_for(stem, branch):
     """
     s = _norm_stem(stem)
     b = _norm_branch(branch)
+    
+    if s is None or b is None:    # ✅ 정규화 실패는 계산 생략
+        return None
 
     dirn = +1 if s in YANG_STEMS else -1
     start = _idx(BRANCHES_KO, START_BRANCH_FOR_JANGSAENG[s])  # 장생
@@ -89,9 +95,29 @@ def pillars_unseong(day_stem, pillars):
     s = _norm_stem(day_stem)
     out = {}
     for k, v in pillars.items():
-        out[k] = unseong_for(s, v)
+        if not v:                 # ✅ None/빈값이면 그대로 None 저장
+            out[k] = None
+            continue
+        try:
+            out[k] = unseong_for(s, v)
+        except Exception as e:
+            print(f"[pillars_unseong] skip {k}={v!r}: {e}")
+            out[k] = None
     return out
 
 def seun_unseong(day_stem, year_branch):
     """일간 기준 '해(세운) 지지'의 운성만 간단히 구함"""
     return unseong_for(day_stem, year_branch)
+
+
+# === 0) 간지에서 지지(마지막 글자)만 뽑아오는 작은 유틸 ===
+def _branch_of(ganji: str | None) -> str | None:
+    """
+    '戊戌' → '戌', '경오' → '오', None → None
+    한자/한글 모두 허용. 주어진 문자열의 '마지막 글자'를 지지로 간주.
+    """
+    if not ganji or not isinstance(ganji, str) or len(ganji) == 0:
+        return None
+    return ganji[-1]
+
+

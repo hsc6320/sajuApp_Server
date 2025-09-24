@@ -1,4 +1,7 @@
 # 오행 매핑
+from converting_time import normalize_ganji
+
+
 five_element_map = {
     '甲': '木', '乙': '木',
     '丙': '火', '丁': '火',
@@ -104,3 +107,65 @@ def get_ji_sipshin_only(ilgan: str, ji: str) -> str:
         return get_sipshin(il_gan, last_stem)
     
     return '없음'
+
+
+# ── 표준 테이블
+BRANCHES_HJ = ["子","丑","寅","卯","辰","巳","午","未","申","酉","戌","亥"]
+BRANCHES_KO = ["자","축","인","묘","진","사","오","미","신","유","술","해"]
+
+STEMS_HJ = ["甲","乙","丙","丁","戊","己","庚","辛","壬","癸"]
+STEMS_KO = ["갑","을","병","정","무","기","경","신","임","계"]
+
+KO2HJ_BRANCH = {ko: hj for ko, hj in zip(BRANCHES_KO, BRANCHES_HJ)}
+HJ2KO_BRANCH = {hj: ko for ko, hj in zip(BRANCHES_HJ, BRANCHES_KO)}
+
+KO2HJ_STEM   = {ko: hj for ko, hj in zip(STEMS_KO, STEMS_HJ)}
+HJ2KO_STEM   = {hj: ko for ko, hj in zip(STEMS_HJ, STEMS_KO)}
+
+def _norm_branch(x: str | None) -> str | None:
+    """
+    지지 입력을 한자(子..亥)로 표준화.
+    허용: '戌', '술', '庚戌' 같은 혼합 문자열(마지막 글자 사용)
+    """
+    if not x or not isinstance(x, str):
+        return None
+    c = x.strip()[-1]            # 마지막 글자(지지 후보)
+    if c in BRANCHES_HJ:         # 이미 한자 지지
+        return c
+    if c in KO2HJ_BRANCH:        # 한글 지지 → 한자
+        return KO2HJ_BRANCH[c]
+    return None
+
+def _norm_stem(x: str | None) -> str | None:
+    """
+    천간 입력을 한자(甲..癸)로 표준화.
+    허용: '庚', '경', '경오'(앞 글자 사용) 등
+    """
+    if not x or not isinstance(x, str):
+        return None
+    c = x.strip()[0]             # 첫 글자(천간 후보)
+    if c in STEMS_HJ:
+        return c
+    if c in KO2HJ_STEM:
+        return KO2HJ_STEM[c]
+    return None
+
+
+def split_ganji_parts(s: str | None) -> tuple[str | None, str | None]:
+    """
+    기존 normalize_ganji(s)로 간지 토큰을 먼저 추출(정규식 매치)한 뒤,
+    천간/지지를 각각 한자 표준으로 반환.
+    예: '2018년 무술' → ('戊','戌'), '경오' → ('庚','午')
+    """
+    if not s: 
+        return None, None
+    token = normalize_ganji(s)  # ← 네가 이미 가진 함수 (없으면 None)
+    if not token:
+        return None, None
+    return _norm_stem(token), _norm_branch(token)
+
+def stem_from_any(s: str | None) -> str | None:
+    st, _ = split_ganji_parts(s); return st
+
+def branch_from_any(s: str | None) -> str | None:
+    _, br = split_ganji_parts(s); return br

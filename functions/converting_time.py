@@ -1,7 +1,7 @@
 from datetime import datetime
 import os
 import re
-from ganji_converter import get_wolju_from_date, get_year_ganji_from_json, get_ilju
+from ganji_converter import _json_year_bounds, get_wolju_from_date, get_year_ganji_from_json, get_ilju, resolve_two_digit_year
 
 # from ganji_converter import get_year_ganji_from_json
 
@@ -248,6 +248,7 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
                 absolute_expressions.append(abs_month)
 
         elif re.search(r"\d+\s*년\s*[뒤후전]", item):
+            print(f"n년뒤/후/전")
             matches = re.findall(r"\d+", item)
             print(f"matches : {matches}")
             if not matches:
@@ -280,12 +281,22 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
             year_suffix = int(m2.group(1))
 
             # 현재 세기 계산
-            century = (current_year // 100) * 100
-            full_year = (
-                century + year_suffix
-                if year_suffix >= (current_year % 100)
-                else century + 100 + year_suffix
-            )
+            # 기존:
+            # century = (current_year // 100) * 100
+            # full_year = (
+            #     century + year_suffix
+            #     if year_suffix >= (current_year % 100)
+            #     else century + 100 + year_suffix
+            # )
+            MIN_YEAR, MAX_YEAR = _json_year_bounds(JSON_PATH)
+
+            # 교체:
+            full_year = resolve_two_digit_year(year_suffix, today=datetime.now(), prefer_past_on_tie=True)
+
+            # ✅ 여기서 범위 가드
+            assert MIN_YEAR <= full_year <= MAX_YEAR, f"비정상 연도 해석: {full_year} (지원 범위: {MIN_YEAR}~{MAX_YEAR})"
+
+
             absolute_expressions.append(str(full_year))
 
             # 연간 간지 치환
@@ -306,6 +317,7 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
 
         # === 월 단위 상대 표현 === (예: 3개월 후 / 2달 전 / 3 달 후)
         elif (m := re.search(r"(?<!\d)(\d+)\s*(?:개월|달)\s*(뒤|후|전)\b", item)):
+            print(f"=== 월 단위 상대 표현 === (예: 3개월 후 / 2달 전 / 3 달 후)")
             offset = int(m.group(1))
             direction = m.group(2)  # '뒤' | '후' | '전'
 
@@ -350,10 +362,30 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
 
         # ===== 명시적 연도(yyyy년) (+ 월) =====
         elif re.match(r"\d{4}년", item):
-            year = re.match(r"\d{4}", item).group()
-            absolute_expressions.append(year)
-            if (abs_month := handle_month_in_item(item, year, JSON_PATH, relative_to_ganji_map)):
-                absolute_expressions.append(abs_month)
+            print(f"명시적 연도(yyyy년) (+ 월)")
+            m_year = re.match(r"(?P<y>\d{4})", item)
+            if m_year:
+                MIN_YEAR, MAX_YEAR = _json_year_bounds(JSON_PATH)
+                year = int(m_year.group("y"))
+
+                # ✅ JSON 커버 범위 가드
+                if not (MIN_YEAR <= year <= MAX_YEAR):
+                    raise ValueError(f"지원하지 않는 연도: {year} (지원 범위: {MIN_YEAR}~{MAX_YEAR})")
+
+                # 절대표현(연도)은 그대로 넣되,
+                absolute_expressions.append(str(year))
+
+                # 선택: 'yyyy년' → '간지년' 치환 맵도 등록해주면 후속 처리에 유리
+                y_ganji = get_year_ganji_from_json(datetime(year, 5, 1), JSON_PATH)
+                # 원문 토큰(공백/‘년’ 유무 등)을 최대한 보존
+                # 예: "2024년", "2024 년" 모두 매칭
+                for tok in re.findall(rf"{year}\s*년", item):
+                    relative_to_ganji_map[tok] = f"{y_ganji}년"
+
+                # 월이 있다면 월주까지
+                abs_month = handle_month_in_item(item, year, JSON_PATH, relative_to_ganji_map)
+                if abs_month is not None:
+                    absolute_expressions.append(abs_month)
 
         # === 그 외 ===
         else:
@@ -394,15 +426,6 @@ def to_hanzi_ji(ji_ko: str) -> str:
         return BRANCH_HZ[BRANCH_KO.index(ji_ko)]
     return ji_ko
 
-def normalize_ganji(token: str) -> str:
-    """공백/접미사 제거 + 한글 간지면 한자로 변환 → '乙巳' 형태로 통일"""
-    t = re.sub(r"\s+", "", token)
-    t = re.sub(r"[년월일시年月日時]", "", t)
-    # 한글 간지 2글자 -> 한자로 교체
-    if len(t) == 2 and t[0] in "".join(STEMS_KO) and t[1] in "".join(BRANCH_KO):
-        return to_hanzi_gan(t[0]) + to_hanzi_ji(t[1])
-    # 이미 한자라면 그대로
-    return t
 
 # 접미사 "필수"로 강제 (이전 버전과의 차이!)
 YEAR_RX  = re.compile(r"(?:[갑을병정무기경신임계甲乙丙丁戊己庚辛壬癸]\s*[자축인묘진사오미신유술해子丑寅卯辰巳午未申酉戌亥])\s*(?:년|年)")
@@ -415,6 +438,7 @@ def sexagenary_of_gregorian_year(year: int, prefer_hanzi: bool = True) -> str:
     서기 연도 → 간지. 1984=甲子 기준.
     index = (year - 4) % 10/12
     """
+    print("sexagenary_of_gregorian_year")
     stem = (year - 4) % 10
     branch = (year - 4) % 12
     gan_ko = STEMS_KO[stem]
@@ -432,12 +456,13 @@ MONTH_RX = re.compile(rf"{GANJI_RX}\s*월")
 DAY_RX   = re.compile(rf"{GANJI_RX}\s*일")
 HOUR_RX  = re.compile(rf"{GANJI_RX}\s*시")
 
-def normalize_ganji(s: str) -> str:
+def normalize_ganji(s: str) -> str:    
     return re.search(GANJI_RX, s).group(0) if re.search(GANJI_RX, s) else None
 
 def sexagenary_of_gregorian_year(y: int, prefer_hanzi=True) -> str:
     # 연간지 변환기(간단 스텁). 실제 로직/테이블과 연결되어 있다면 그걸 호출하세요.
     # 여기선 안전하게 None 반환 방지용으로 둡니다.
+    print("sexagenary_of_gregorian_year222")
     try:
         stems = "甲乙丙丁戊己庚辛壬癸"
         branches = "子丑寅卯辰巳午未申酉戌亥"

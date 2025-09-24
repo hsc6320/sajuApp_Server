@@ -16,7 +16,7 @@ import os, re, json
 from datetime import date, datetime, timedelta
 from langchain_openai import ChatOpenAI
 
-from conv_store import _CUR_USER_ID, _new_db_skeleton, _resolve_store_path_for_user, make_user_key, set_current_user_context, user_from_payload
+from conv_store import _CUR_USER_ID, _is_gs_path, _max_turns, _parse_gs_path, _resolve_store_path_for_user, _trim_session_turns, get_current_user_id, make_user_key, set_current_user_context, user_from_payload
 try:
     from zoneinfo import ZoneInfo  # Py3.9+
 except Exception:
@@ -53,14 +53,14 @@ JSON 한 줄로만 응답:
 from google.cloud import storage
 
 
-def _parse_gs_path(gs_path: str) -> tuple[str, str]:
-    # gs://bucket/name/with/slashes.json -> (bucket, name/with/slashes.json)
-    no_scheme = gs_path[len("gs://"):]
-    parts = no_scheme.split("/", 1)
-    bucket = parts[0]
-    name = parts[1] if len(parts) > 1 else ""
-    #print(f"_parse_gs_path({str}, name : {name})")
-    return bucket, name
+# def _parse_gs_path(gs_path: str) -> tuple[str, str]:
+#     # gs://bucket/name/with/slashes.json -> (bucket, name/with/slashes.json)
+#     no_scheme = gs_path[len("gs://"):]
+#     parts = no_scheme.split("/", 1)
+#     bucket = parts[0]
+#     name = parts[1] if len(parts) > 1 else ""
+#     #print(f"_parse_gs_path({str}, name : {name})")
+#     return bucket, name
 
 
 def _gcs_read_text(gs_path: str) -> str:
@@ -70,7 +70,7 @@ def _gcs_read_text(gs_path: str) -> str:
     blob = bkt.blob(name)
     if not blob.exists(client):
         raise FileNotFoundError(gs_path)
-    return blob.download_as_text(encoding="utf-8")
+    return blob.download_as_text(encoding="utf-8", timeout=10)
 
 
 # ------- 유틸: 안전 자카드 (키워드 겹침 점수) --------------------------------
@@ -588,16 +588,8 @@ def build_question_with_regression_context(
 
 from contextvars import ContextVar
 
-def _get_current_user_id() -> str | None:  
-    try:
-        uid = _CUR_USER_ID.get()
-    except LookupError:
-        uid = None
-    return (uid or "").strip() or None
-
-
-def _is_gs_path(p: str) -> bool:
-    return isinstance(p, str) and p.startswith("gs://")
+#def _is_gs_path(p: str) -> bool:
+#    return isinstance(p, str) and p.startswith("gs://")
 
 def _resolve_store_path() -> str:
     """
@@ -607,10 +599,10 @@ def _resolve_store_path() -> str:
     - 설정되지 않았으면 기존 전역(conversations.json) 경로 유지.
     """
     #uid = _CUR_USER_ID.get()
-    uid = _get_current_user_id()
+    uid = get_current_user_id()
     if uid:
         path = _resolve_store_path_for_user(uid)
-        print(f"[PATH] user={uid} → {path}")
+     #   print(f"[PATH] user={uid} → {path}")        //[PATH] user=김지은__19880716 → gs://chatsaju-5cd67-convos/김지은__19880716.json
         return path
     
     # (전역 파일로 저장하는 *레거시* 경로 — 사용자 미지정 요청 전용)
@@ -637,13 +629,13 @@ def _gcs_write_text(gs_path: str, text: str) -> None:
     blob = bkt.blob(name)
     blob.cache_control = "no-store"
     blob.content_type = "application/json"
-    blob.upload_from_string(text, content_type="application/json")
+    blob.upload_from_string(text, content_type="application/json", timeout=10)
     #print(f"[JSON-SAVE] GCS {gs_path} 저장 완료 (size={len(text)} bytes)")
 
 
 def _db_load() -> dict:    
     path = _resolve_store_path()
-    print(f"[PATH] {_resolve_store_path.__name__} → {path}")
+    #print(f"[PATH] {_resolve_store_path.__name__} → {path}")       //[PATH] _resolve_store_path → gs://chatsaju-5cd67-convos/김지은__19880716.json
     
     try:
         if _is_gs_path(path):
@@ -706,136 +698,6 @@ def _norm(s: str) -> str:
     return (s or "").casefold()
 
 
-def search_messages(
-    *,
-    query: str | None = None,
-    keywords: list[str] | None = None,
-    keyword_match: str = "any",     # "any" | "all"
-    date: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
-    target_date: str | None = None,
-    session_id: str | None = None,
-    role: str | None = None,
-    mode: str | None = None,
-    has_target: bool | None = None,
-    limit: int = 50,
-    offset: int = 0,
-    user: Optional[Dict[str, Any]] = None,          # {"id","name","birth"} 직접 전달
-    payload: Optional[Dict[str, Any]] = None,       # {"user":{"name","birth"}} 형태
-) -> Tuple[list[dict], int]:
-    """
-    conversations.json 전체에서 조건으로 필터링하여 최신순 반환.
-    - sessions가 dict(권장) 이든 list(과거 포맷) 이든 모두 지원
-    return: (rows, total_count)
-    
-    - user/payload로 사용자 컨텍스트를 임시 설정할 수 있음.
-    - 설정하지 않으면 현재 컨텍스트(_CUR_USER_ID) 또는 전역 파일에서 검색.
-    """
-    
-    _needs_reset = False
-    if user:
-        set_current_user_context(user=user); _needs_reset = True
-    elif payload:
-        up = user_from_payload(payload)
-        if up:
-            set_current_user_context(user=up); _needs_reset = True
-            
-    try:
-        db = _db_load()
-        rows: list[dict] = []
-
-        # --- 입력 정규화 ---
-        q = _norm(query) if query else None
-        kwset = set((k or "").strip() for k in (keywords or []) if k and k.strip())
-
-        sessions = db.get("sessions", {})
-        # sessions가 list일 수도 있으므로 이터레이터 통일
-        def _iter_sessions():
-            if isinstance(sessions, dict):
-                for sid, sess in sessions.items():
-                    yield sid, sess
-            elif isinstance(sessions, list):
-                for sess in sessions:
-                    sid = (sess.get("meta", {}) or {}).get("session_id") or sess.get("id") or "unknown"
-                    yield sid, sess
-            else:
-                return
-
-        for sid, sess in _iter_sessions():
-            if session_id and sid != session_id:
-                continue
-
-            turns = sess.get("turns", []) or []
-            for turn in turns:
-                # --- 공통 필터 ---
-                if role and turn.get("role") != role:
-                    continue
-                if mode and turn.get("mode") != mode:
-                    continue
-                if date and turn.get("date") != date:
-                    continue
-                if date_from and (turn.get("date", "") < date_from):
-                    continue
-                if date_to and (turn.get("date", "") > date_to):
-                    continue
-                if target_date and turn.get("target_date") != target_date:
-                    continue
-                if has_target is True and not turn.get("target_date"):
-                    continue
-                if has_target is False and turn.get("target_date"):
-                    continue
-
-                # --- 키워드 필터(msg_keywords) ---
-                msgs_kw = turn.get("msg_keywords") or []
-                # 혹시 문자열로 저장된 경우 방어
-                if isinstance(msgs_kw, str):
-                    msgs_kw = [msgs_kw]
-                if kwset:
-                    msg_kw_set = set(msgs_kw)
-                    if keyword_match == "all":
-                        if not kwset.issubset(msg_kw_set):
-                            continue
-                    else:  # "any"
-                        if kwset.isdisjoint(msg_kw_set):
-                            continue
-
-                # --- 자유 텍스트 필터(본문/요약/키워드 포함) ---
-                if q:
-                    hay = " ".join([
-                        _norm(turn.get("text", "")),
-                        _norm(turn.get("notes", "")),
-                        _norm(" ".join(msgs_kw)),
-                    ])
-                    if q not in hay:
-                        continue
-
-                # 매치된 항목 수집 (+ 세션 id 주입)
-                row = dict(turn)
-                row["_session_id"] = sid
-                rows.append(row)
-
-        # --- 정렬: ts(ISO) 우선, 없으면 date+time 사용 ---
-        def _key(t: dict):
-            ts = t.get("ts")
-            if ts:
-                return ts
-            return f"{t.get('date','')}T{t.get('time','')}+0000"
-
-        rows.sort(key=_key, reverse=True)
-
-        total = len(rows)
-        start = max(0, int(offset))
-        end = start + max(0, int(limit))
-        sliced = rows[start:end]
-
-        #print(f"[SEARCH] total={total}, offset={offset}, limit={limit}, returned={len(sliced)}")
-        return sliced, total
-    finally:
-        if _needs_reset:
-            set_current_user_context(reset=True)
-
-  
 # ---- JSON 저장소 유틸 ----
 #CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 #_CONVO_STORE = os.path.join(CURRENT_DIR, "conversations.json")
@@ -872,8 +734,9 @@ def record_turn_message(
     한 턴(메시지)을 JSON DB에 기록.
     - auto_meta=True: OpenAI로 메타 자동 추출
     - extra_meta: 간지 등 추가 필드를 dict로 전달하면 turn에 합쳐 저장
-    
-    - user / payload 인자로 사용자 컨텍스트를 임시 설정할 수 있음.
+    - N은 CONVO_MAX_TURNS 환경변수(기본 300)
+    - GCS에 전체 JSON을 다시 업로드(덮어쓰기)하므로, 오래된 턴은 자연스럽게 사라진다(밀어내기).
+    - user / payload를 주면 해당 호출 스코프에서만 사용자 컨텍스트를 임시 설정한다.
     - 설정하지 않으면 현재 컨텍스트(_CUR_USER_ID) 또는 전역 파일 사용.
     """
     
@@ -918,8 +781,18 @@ def record_turn_message(
                     turn[k] = v
             print(f"[META-EXTRA] 추가 메타: {extra_meta}")
 
+        # ── [D] append → 오래된 턴 컷 → 저장(덮어쓰기) ─────────────────────────
         db["sessions"][session_id]["turns"].append(turn)
-        _db_save(db)
+
+        cur_len = len(db["sessions"][session_id]["turns"])
+        print(f"[TRIM][PRE] session='{session_id}' appended -> len={cur_len}")
+        removed = _trim_session_turns(db, session_id, max_turns=_max_turns())
+        if removed:
+            kept = len(db["sessions"][session_id]["turns"])
+            print(f"[TRIM] session='{session_id}' removed={removed} kept={kept} (limit={_max_turns()})")
+
+        _db_save(db)  # GCS에 전체 JSON 재업로드 → 앞쪽(오래된) 턴은 파일에서 제거됨
+
     finally:
         # ── [C] 이 함수 내부에서 컨텍스트를 세팅했다면 끝나고 해제 ────────────────
         if _needs_reset:
@@ -1041,24 +914,3 @@ def _maybe_override_target_date(question: str, parsed: dict, now: date) -> None:
             break
         
         
-def migrate_global_to_user(name: str, birth: str) -> str:
-    """
-    현재 전역 conversations.json의 내용을 '해당 사용자' 파일로 복사합니다.
-    - 이미 사용자 파일에 내용이 있으면 덮어씌웁니다.
-    - 반환: 대상 사용자 파일 경로(로컬 path 또는 gs://...)
-    """
-    # 1) 전역 DB 로드
-    global_db = _db_load()  # 현재 _CUR_USER_ID가 None이어야 전역 파일을 읽음
-
-    # 2) 사용자 컨텍스트 설정 후 skeleton으로 교체
-    uid = make_user_key(name, birth)
-    set_current_user_context(name=name, birth=birth)
-    try:
-        user_path = _resolve_store_path()  # 사용자 파일 경로
-        user_db = _new_db_skeleton()
-        user_db["sessions"] = global_db.get("sessions", {})
-        _db_save(user_db)
-        print(f"[MIGRATE] global → {user_path}")
-        return user_path
-    finally:
-        set_current_user_context(reset=True)

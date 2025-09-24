@@ -44,6 +44,13 @@ def get_year_ganji_from_json(date: datetime, json_path: str = JSON_PATH) -> str:
     with open(json_path, "r", encoding="utf-8") as f:
         json_data = json.load(f)
 
+     # ✅ 범위 가드 (JSON 커버리지 밖이면 명확히 예외)
+    min_base = min(datetime.strptime(e["양력기준일"], "%Y-%m-%d") for e in json_data)
+    max_base = max(datetime.strptime(e["양력기준일"], "%Y-%m-%d") for e in json_data)
+    assert min_base <= date <= max_base, (
+        f"간지 조회 범위 초과: {date.date()} (지원: {min_base.date()}~{max_base.date()})"
+    )
+    
     for entry in reversed(json_data):
         base_date = datetime.strptime(entry["양력기준일"], "%Y-%m-%d")
         if date >= base_date:
@@ -178,3 +185,46 @@ def get_ilju(solar_date: datetime, json_path="converted.json") -> str:
     ilju = ganji60[ilju_index].strip()
     print(f"ganji60[{ilju_index}] : {ilju}")
     return convert_ganji_to_hanja(ilju)
+
+
+def resolve_two_digit_year(year_suffix: int,
+                           today: datetime | None = None,
+                           prefer_past_on_tie: bool = True) -> int:
+    """
+    두 자리 연도(0..99)를 현재 날짜 기준 '가장 가까운 4자리 연도'로 해석.
+    예) 2025년 현재:
+        24 -> 2024, 26 -> 2026, 99 -> 1999, 00 -> 2000
+    """
+    if not (0 <= year_suffix <= 99):
+        raise ValueError("year_suffix must be in [0, 99]")
+
+    today = today or datetime.now()
+    current_year = today.year
+    century = (current_year // 100) * 100
+
+    candidates = [
+        century - 100 + year_suffix,  # 이전 세기
+        century + year_suffix,        # 현재 세기
+        century + 100 + year_suffix,  # 다음 세기
+    ]
+
+    # 가장 가까운 연도 선택 (절대차 최소)
+    diffs = [abs(y - current_year) for y in candidates]
+    min_diff = min(diffs)
+    closest = [y for y, d in zip(candidates, diffs) if d == min_diff]
+
+    if len(closest) == 1:
+        return closest[0]
+    # 동률이면 과거/미래 선호 규칙
+    return max(closest) if not prefer_past_on_tie else min(closest)
+
+# 모듈 로드 시 한 번만 계산
+def _json_year_bounds(json_path: str) -> tuple[int, int]:
+    import json
+    from datetime import datetime
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # 양력기준일이 오름차순/내림차순 어떤 상태든 안전하게 min/max 계산
+    years = [datetime.strptime(e["양력기준일"], "%Y-%m-%d").year for e in data]
+    return min(years), max(years)
