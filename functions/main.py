@@ -180,6 +180,13 @@ SAJU_COUNSEL_SYSTEM = """
 - natal.sipseong_by_pillar: 원국 각 기둥 십성(예: year, month, day, hour)
 - current_daewoon: 현재 대운 {ganji, sipseong?, sibi_unseong?}
 - target_time: 관측 시점(연/월/일/시) {ganji, sipseong?, sibi_unseong?}
+- resolved: (서버에서 정규화해 제공하는 읽기 전용 섹션)
+  - pillars.{year|month|day|hour}: {ganji, stem, branch, sipseong, sibi_unseong?}
+  - flow_now.daewoon: {ganji, sipseong?, sibi_unseong?}
+  - flow_now.target.{year|month|day|hour}: {ganji, sipseong?, sibi_unseong?}
+  - canon:
+    - sipseong_vocab: 허용 십성 라벨 집합
+    - sibi_vocab: 허용 십이운성 라벨 집합
 - meta: {focus?, question, summary}
 
 [모드 자동 판별(상호 배타)]
@@ -191,6 +198,24 @@ SAJU_COUNSEL_SYSTEM = """
 - JSON에 없는 간지/대운/세운/십성/십이운성 새로 계산·추정·생성 금지.
 - COUNSEL/LOOKUP 모드에서는 사주 이론(간지·십성·운성·대운 등) 언급 금지.
 
+[데이터 사용 규약 - 매우 중요]
+- 계산/추정 금지. 입력 JSON만 사용.
+- 십성(sipseong) 읽기 우선순위:
+  1) $.resolved.flow_now.target.{year|month|day|hour}.sipseong
+  2) $.current_daewoon.sipseong
+  3) $.resolved.pillars.{year|month|day|hour}.sipseong
+  (없으면 "데이터 없음"이라고 쓰고 넘어간다.)
+- 십이운성(sibi_unseong) 읽기 우선순위:
+  1) $.resolved.flow_now.target.{year|month|day|hour}.sibi_unseong
+  2) $.current_daewoon.sibi_unseong
+  3) $.resolved.pillars.{year|month|day|hour}.sibi_unseong
+  (없으면 "데이터 없음"이라고 쓰고 넘어간다.)
+- 간지(stem/branch) 언급은 입력 값만 사용. 새로 계산 금지.
+- 용어 고정: 십성/십신 혼용 금지 → 항상 “십성”. 12운성은 “십이운성/운성” 표현 사용.
+- 라벨 집합 고정: 아래 집합 밖 단어 사용 금지.
+  - 십성: $.resolved.canon.sipseong_vocab
+  - 십이운성: $.resolved.canon.sibi_vocab
+  
 [출력 형식]
 - 첫 줄에 모드 태그를 반드시 출력: [MODE: SAJU] | [MODE: COUNSEL] | [MODE: LOOKUP]
 - SAJU:
@@ -199,6 +224,11 @@ SAJU_COUNSEL_SYSTEM = """
   3) 실행 팁 • 2~3개
   4) 주의점 • 1~2개
   5) 한 줄 정리(1문장)
+  6) 근거
+     - (참조 경로와 값을 2~4줄, 실제 사용한 것만 명시. 예시)
+     - 십성(월운): $.resolved.flow_now.target.month.sipseong = "편재"
+     - 12운성(월운): $.resolved.flow_now.target.month.sibi_unseong = "건록"
+     - 대운 십성: $.current_daewoon.sipseong = "편인"
 - COUNSEL: 공감 1문장 + 현실적 제안 2~3문장(사주 언급 금지)
 - LOOKUP: 요청한 값만 간단히 나열(불필요한 해석 없음)
 
@@ -238,13 +268,14 @@ counseling_prompt = ChatPromptTemplate.from_messages([
     # 기존 요약 주입(유지)
     ("system", "이전 대화 요약:\n{summary}"),
 
-    # 🔥 추가: 브릿지/컨텍스트/팩트 사용을 '규칙'으로 강제
+    #  🔥브릿지/컨텍스트/팩트 사용 규칙 (문구 복붙 금지 + 비약 금지 재강조)
     ("system",
      '출력 규칙(중요):\n'
-     '- 반드시 **첫 문장**은 그대로 출력한다: "{bridge}"\n'
-     '- 아래 [FACTS]에 날짜/장소/인물 등이 있으면 **첫 1~2문장**에 자연스럽게 명시한다.\n'
-     '- [CONTEXT]의 과거 대화 범위를 벗어나 새로운 대주제로 비약하지 말 것.\n'
-     '- [CONTEXT]에 없는 사실을 단정하지 말 것. 중복 일반론 나열 금지.'
+     '- 반드시 **첫 문장**은 그대로 출력한다: "{bridge}" (bridge가 비어 있으면 생략)\n'
+     '- [FACTS]에 날짜/장소/인물 등이 있으면 **첫 1~2문장**에 자연스럽게 명시한다.\n'
+     '- [CONTEXT] 범위를 벗어나 새로운 대주제로 비약하지 말 것.\n'
+     '- [CONTEXT]에 없는 사실을 단정하지 말 것. 중복 일반론 나열 금지.\n'
+     '- 답변 마지막에 반드시 "근거" 블록을 포함한다.'
     ),
 
     # 기존 휴먼 입력에 CONTEXT/FACTS/JSON/질문만 확장
@@ -528,7 +559,9 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     day_sip   = _sipseong_for_target(day_stem_hj, t_day_ganji)
     hour_sip  = _sipseong_for_target(day_stem_hj, t_hour_ganji)
     print(f"year_sip : {year_sip}, month_sip : {month_sip}, day_sip : {day_sip}")
-    print(f"target_sibi_map.get(year) : {target_sibi_map.get("year")}, {target_sibi_map.get("month")}, {target_sibi_map.get("day")}")
+    # 따옴표 오류 수정(내부 키는 작은따옴표로)
+    print(f"target_sibi_map.get(year/month/day) : {target_sibi_map.get('year')}, {target_sibi_map.get('month')}, {target_sibi_map.get('day')}")
+
     
     # 최종 스키마 구성
     payload = {
@@ -540,16 +573,16 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         },
         "natal": {
             "sipseong_by_pillar": {
-                "year": yearGan,
-                "month": wolGan,
-                "day": ilGan,
-                "hour": siGan
+                "year": yearGan or None,
+                "month": wolGan or None,
+                "day": ilGan or None,
+                "hour": siGan or None,
             }
         },
         "current_daewoon": {
-            "ganji": current_dw or None,         # 빈 문자열이면 None
+            "ganji": current_dw or None,          # 문자열(예: '辛酉'), 없으면 None
             "sipseong": curr_dw_sipseong,        # "간/지" 조합, 없으면 None
-            "sibi_unseong": curr_dw_sibi,                 # TODO: 필요 시 계산 후 채움
+            "sibi_unseong": curr_dw_sibi,          # 계산된 12운성 (없으면 None)
         },
         "target_time": {
             "year":  {
@@ -591,8 +624,42 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                 "키워드": [],     # 별도 키워드 추출기로 채울 예정이라면 유지
                 "이벤트": []
             }
+        }        
+    }
+    
+     # === E) 정규화 블록(resolved) 추가: 모델은 여기만 보면 됨 ===
+    def _stem(g):   return g[0] if isinstance(g, str) and len(g) >= 1 else None
+    def _branch(g): return g[1] if isinstance(g, str) and len(g) >= 2 else None
+
+    resolved_pillars = {
+        "year":  {"ganji": year or None,  "stem": _stem(year),  "branch": _branch(year),  "sipseong": None, "sibi_unseong": None},
+        "month": {"ganji": month or None, "stem": _stem(month), "branch": _branch(month), "sipseong": None, "sibi_unseong": None},
+        "day":   {"ganji": day or None,   "stem": _stem(day),   "branch": _branch(day),   "sipseong": None, "sibi_unseong": None},
+        "hour":  {"ganji": pillar_hour or None, "stem": _stem(pillar_hour), "branch": _branch(pillar_hour), "sipseong": None, "sibi_unseong": None},
+    }
+
+    payload["resolved"] = {
+        "pillars": resolved_pillars,
+        "flow_now": {
+            "daewoon": {
+                "ganji": current_dw or None,
+                "sipseong": None,             # 현재 대운의 십성 라벨이 없으므로 None
+                "sibi_unseong": curr_dw_sibi, # 계산된 12운성
+            },
+            "target": {
+                "year":  {"ganji": t_year_ganji,  "sipseong": year_sip,  "sibi_unseong": target_sibi_map.get("year")},
+                "month": {"ganji": t_month_ganji, "sipseong": month_sip, "sibi_unseong": target_sibi_map.get("month")},
+                "day":   {"ganji": t_day_ganji,   "sipseong": day_sip,   "sibi_unseong": target_sibi_map.get("day")},
+                "hour":  {"ganji": t_hour_ganji,  "sipseong": hour_sip,  "sibi_unseong": target_sibi_map.get("hour")},
+            }
+        },
+        # 앱 표준에 맞춰 필요 시 조정
+        "canon": {
+            "sipseong_vocab": ["비견","겁재","식신","상관","편재","정재","편관","정관","편인","정인","본체(편인)"],
+            "sibi_vocab": ["양","욕","대극","건록","제왕","쇠","병","사","묘","절","태","양(재생)"]
         }
     }
+    
 
     return payload
 
