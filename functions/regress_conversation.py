@@ -16,7 +16,7 @@ import os, re, json
 from datetime import date, datetime, timedelta
 from langchain_openai import ChatOpenAI
 
-from conv_store import _CUR_USER_ID, _is_gs_path, _max_turns, _parse_gs_path, _resolve_store_path_for_user, _trim_session_turns, get_current_user_id, make_user_key, set_current_user_context, user_from_payload
+from conv_store import _CUR_USER_ID, _db_load, _db_save, _is_gs_path, _max_turns, _parse_gs_path, _resolve_store_path_for_user, _trim_session_turns, get_current_user_id, make_user_key, set_current_user_context, user_from_payload
 try:
     from zoneinfo import ZoneInfo  # Py3.9+
 except Exception:
@@ -63,14 +63,6 @@ from google.cloud import storage
 #     return bucket, name
 
 
-def _gcs_read_text(gs_path: str) -> str:
-    bucket, name = _parse_gs_path(gs_path)
-    client = storage.Client()
-    bkt = client.bucket(bucket)
-    blob = bkt.blob(name)
-    if not blob.exists(client):
-        raise FileNotFoundError(gs_path)
-    return blob.download_as_text(encoding="utf-8", timeout=10)
 
 
 # ------- 유틸: 안전 자카드 (키워드 겹침 점수) --------------------------------
@@ -591,108 +583,6 @@ from contextvars import ContextVar
 #def _is_gs_path(p: str) -> bool:
 #    return isinstance(p, str) and p.startswith("gs://")
 
-def _resolve_store_path() -> str:
-    """
-    [변경점]
-    - _CUR_USER_ID(현재 사용자 컨텍스트)가 설정되어 있으면
-      '그 사용자 전용 파일 경로'를 반환.
-    - 설정되지 않았으면 기존 전역(conversations.json) 경로 유지.
-    """
-    #uid = _CUR_USER_ID.get()
-    uid = get_current_user_id()
-    if uid:
-        path = _resolve_store_path_for_user(uid)
-     #   print(f"[PATH] user={uid} → {path}")        //[PATH] user=김지은__19880716 → gs://chatsaju-5cd67-convos/김지은__19880716.json
-        return path
-    
-    # (전역 파일로 저장하는 *레거시* 경로 — 사용자 미지정 요청 전용)
-    in_cloud = bool(os.getenv("K_SERVICE") or os.getenv("FUNCTION_TARGET") or os.getenv("FIREBASE_CONFIG"))
-    if in_cloud:
-        bucket = os.getenv("GCS_BUCKET")
-        if not bucket:
-            # 기본값('your-project-id.appspot.com') 절대 쓰지 않음
-            print(f"GCS_BUCKET = {bucket}")
-            raise RuntimeError("GCS_BUCKET not set. 예: GCS_BUCKET=chatsaju-5cd67-convos")
-        path = f"gs://{bucket}/user_id.json"
-        print(f"[PATH] (legacy global) Cloud → {path}")
-        return path
-    
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(current_dir, "conversations.json")
-    print(f"[PATH] (legacy global) Local → {path}")
-    return path
-
-def _gcs_write_text(gs_path: str, text: str) -> None:
-    bucket, name = _parse_gs_path(gs_path)
-    client = storage.Client()
-    bkt = client.bucket(bucket)
-    blob = bkt.blob(name)
-    blob.cache_control = "no-store"
-    blob.content_type = "application/json"
-    blob.upload_from_string(text, content_type="application/json", timeout=10)
-    #print(f"[JSON-SAVE] GCS {gs_path} 저장 완료 (size={len(text)} bytes)")
-
-
-def _db_load() -> dict:    
-    path = _resolve_store_path()
-    #print(f"[PATH] {_resolve_store_path.__name__} → {path}")       //[PATH] _resolve_store_path → gs://chatsaju-5cd67-convos/김지은__19880716.json
-    
-    try:
-        if _is_gs_path(path):
-            raw = _gcs_read_text(path)
-            db = json.loads(raw)
-        else:
-            with open(path, "r", encoding="utf-8") as f:
-                db = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        print(f"[JSON-LOAD] {path} 없음/비어있음 → 새 DB 구조 생성")
-        db = {"version": 1, "sessions": {}}
-        # (A) 사용자 컨텍스트가 잡혀 있으면 user 메타 주입
-        try:
-            # conv_store.set_current_user_context() 를 쓰는 구조라면:
-            uid = globals().get("_CUR_USER_ID", None)
-            um  = globals().get("_CUR_USER_META", None)
-            if uid and um:
-                db["user"] = {"id": uid, **um}
-        except Exception:
-            pass
-
-    # list → dict 마이그레이션 유지
-    sess = db.get("sessions")
-    if isinstance(sess, list):
-        new_sessions = {}
-        for s in sess:
-            sid = (s.get("meta") or {}).get("session_id") or s.get("id") or f"migrated_{len(new_sessions)+1}"
-            new_sessions[sid] = s
-        db["sessions"] = new_sessions
-    if "sessions" not in db or not isinstance(db["sessions"], dict):
-        db["sessions"] = {}
-    return db
-
-
-def _db_save(db: dict) -> None:
-    path = _resolve_store_path()
-    payload = json.dumps(db, ensure_ascii=False, indent=2)
-    #print(f"path : {path}, payload : {payload}") // payload: 모든 대화내용 출력 , path :  gs://chatsaju-5cd67-convos/conversations.json
-    if _is_gs_path(path):
-        _gcs_write_text(path, payload)
-    else:
-        # (B) 로컬 원자적 쓰기: <file>.tmp → replace
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(payload)
-        os.replace(tmp, path)
-
-    # 진단용: 총 턴 수 출력
-    sessions = db.get("sessions", {})
-    turns = 0
-    if isinstance(sessions, dict):
-        for s in sessions.values():
-            turns += len(s.get("turns", []))
-    #print(f"[JSON-SAVE] {path} 저장 완료 (세션 수: {len(sessions)}, 총 턴 수: {turns})")       #저장 로그: 
-    
-    
 
 def _norm(s: str) -> str:
     return (s or "").casefold()
@@ -785,11 +675,11 @@ def record_turn_message(
         db["sessions"][session_id]["turns"].append(turn)
 
         cur_len = len(db["sessions"][session_id]["turns"])
-        print(f"[TRIM][PRE] session='{session_id}' appended -> len={cur_len}")
-        removed = _trim_session_turns(db, session_id, max_turns=_max_turns())
-        if removed:
-            kept = len(db["sessions"][session_id]["turns"])
-            print(f"[TRIM] session='{session_id}' removed={removed} kept={kept} (limit={_max_turns()})")
+        print(f"[STORE] session='{session_id}' appended -> len={cur_len}")
+        # removed = _trim_session_turns(db, session_id, max_turns=_max_turns())
+        # if removed:
+        #     kept = len(db["sessions"][session_id]["turns"])
+        #     print(f"[TRIM] session='{session_id}' removed={removed} kept={kept} (limit={_max_turns()})")
 
         _db_save(db)  # GCS에 전체 JSON 재업로드 → 앞쪽(오래된) 턴은 파일에서 제거됨
 

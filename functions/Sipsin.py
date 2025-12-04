@@ -1,4 +1,5 @@
 # 오행 매핑
+import re
 from converting_time import normalize_ganji
 
 
@@ -159,7 +160,8 @@ def split_ganji_parts(s: str | None) -> tuple[str | None, str | None]:
     """
     if not s: 
         return None, None
-    token = normalize_ganji(s)  # ← 네가 이미 가진 함수 (없으면 None)
+    #token = normalize_ganji(s)  # ← 네가 이미 가진 함수 (없으면 None)
+    token = norm_ganji_to_hanzi(s)   # ← 네가 이미 가진 함수 (없으면 None)
     if not token:
         return None, None
     return _norm_stem(token), _norm_branch(token)
@@ -169,3 +171,44 @@ def stem_from_any(s: str | None) -> str | None:
 
 def branch_from_any(s: str | None) -> str | None:
     _, br = split_ganji_parts(s); return br
+
+
+# ── 간지 패턴: '甲申', '乙巳' 등
+GANJI_RX = r"[甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥]"
+YEAR_RX  = re.compile(rf"{GANJI_RX}\s*년")
+MONTH_RX = re.compile(rf"{GANJI_RX}\s*월")
+DAY_RX   = re.compile(rf"{GANJI_RX}\s*일")
+HOUR_RX  = re.compile(rf"{GANJI_RX}\s*시")
+def norm_ganji_to_hanzi(s: str | None) -> str | None:
+    """
+    입력 문자열에서 간지 토큰(한자/한글/혼합)을 표준 한자 2글자(甲..癸)(子..亥)로 추출.
+    예) '계해' → '癸亥', '경오년' → '庚午', '2018년 무술' → '戊戌'
+    """
+    if not s:
+        return None
+
+    t = str(s).strip()
+    # 흔한 구분자/공백 제거
+    t = t.replace(" ", "").replace("-", "").replace("/", "")
+
+    # 1) 한글 2글자 간지 (예: 계해, 경오)
+    if len(t) >= 2 and t[0] in KO2HJ_STEM and t[-1] in KO2HJ_BRANCH:
+        return KO2HJ_STEM[t[0]] + KO2HJ_BRANCH[t[-1]]
+
+    # 2) 혼합형: (한자 천간 + 한글 지지) 또는 (한글 천간 + 한자 지지)
+    if len(t) >= 2:
+        a, b = t[0], t[-1]
+        if a in STEMS_HJ and b in KO2HJ_BRANCH:
+            return a + KO2HJ_BRANCH[b]
+        if a in KO2HJ_STEM and b in BRANCHES_HJ:
+            return KO2HJ_STEM[a] + b
+
+    # 3) 한자 간지 패턴 내장 검색 (문장 속에 섞여 있을 때)
+    m = re.search(GANJI_RX, t)
+    if m:
+        return m.group(0)
+
+    return None
+
+
+    

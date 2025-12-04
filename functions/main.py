@@ -1,8 +1,10 @@
 from curses import meta
 from datetime import date, datetime
+import hashlib
 import logging
 import os
-import json 
+import json
+from typing import Optional 
 from dotenv import load_dotenv
 
 from conv_store import (
@@ -10,17 +12,24 @@ from conv_store import (
     make_user_id_from_name,
     delete_current_user_store,
     get_current_user_id,
-    _resolve_store_path_for_user
+    _resolve_store_path_for_user,
+    trim_session_history,
+    MAX_TURNS
 )
+from creativeBrief import build_creative_brief
+
+
+from ganjiArray import extract_comparison_slices, format_comparison_block, parse_compare_specs
+from ganji_converter import Scope
 
 from regress_conversation import ISO_DATE_RE, KOR_ABS_DATE_RE, _db_load, _maybe_override_target_date, _today, ensure_session, record_turn_message, get_extract_chain, build_question_with_regression_context
-from converting_time import extract_target_ganji_v2, convert_relative_time
+from converting_time import extract_target_ganji_v2, convert_relative_time, parse_korean_date_safe
 from regress_Deixis import _make_bridge, build_regression_and_deixis_context
 from sip_e_un_sung import _branch_of, unseong_for, branch_for, pillars_unseong, seun_unseong
 from Sipsin import _norm_stem, branch_from_any, get_sipshin, get_ji_sipshin_only, stem_from_any
 from choshi_64 import GUA
 from ganji_converter import get_ilju, get_wolju_from_date, get_year_ganji_from_json, JSON_PATH
-from langchain.chains import create_extraction_chain
+#from langchain.chains import create_extraction_chain
 import google.cloud.firestore
 
 from langchain_openai import ChatOpenAI 
@@ -29,6 +38,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.messages import SystemMessage,HumanMessage, AIMessage
 from langchain.memory import ConversationSummaryBufferMemory
+
 from langchain.chains import LLMChain
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories  import ChatMessageHistory
@@ -48,53 +58,6 @@ import google.cloud.firestore
 app = initialize_app()
 # [END import]
 
-# [START addMessage]
-# [START addMessageTrigger]
-@https_fn.on_request()
-def addmessage(req: https_fn.Request) -> https_fn.Response:
-    """Take the text parameter passed to this HTTP endpoint and insert it into
-    a new document in the messages collection."""
-# [END addMessageTrigger]
-    # Grab the text parameter.
-    original = req.args.get("text")
-    if original is None:
-        return https_fn.Response("No text parameter provided", status=400)
-
-    # [START adminSdkPush]
-    firestore_client: google.cloud.firestore.Client = firestore.client()
-
-    # Push the new message into Cloud Firestore using the Firebase Admin SDK.
-    _, doc_ref = firestore_client.collection("messages").add({"original": original})
-
-    # Send back a message that we've successfully written the message
-    return https_fn.Response(f"Message with ID {doc_ref.id} added.")
-    # [END adminSdkPush]
-# [END addMessage]
-
-
-
-# [START makeUppercase]
-@firestore_fn.on_document_created(document="messages/{pushId}")
-def makeuppercase(event: firestore_fn.Event[firestore_fn.DocumentSnapshot | None]) -> None:
-    """Listens for new documents to be added to /messages. If the document has
-    an "original" field, creates an "uppercase" field containg the contents of
-    "original" in upper case."""
-
-    # Get the value of "original" if it exists.
-    if event.data is None:
-        return
-    try:
-        original = event.data.get("original")
-    except KeyError:
-        # No "original" field, so do nothing.
-        return
-
-    # Set the "uppercase" field.
-    print(f"Uppercasing {event.params['pushId']}: {original}")
-    upper = original.upper()
-    event.data.reference.update({"uppercase": upper})
-# [END makeUppercase]
-# [END all]
 
 import functions_framework
 from firebase_functions import https_fn, options
@@ -105,7 +68,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain.memory import ConversationSummaryBufferMemory, ChatMessageHistory
+
 from langchain_openai import ChatOpenAI
 from langchain.chains import LLMChain
 from google.cloud import storage
@@ -118,8 +81,9 @@ print("✅ OPENAI_API_KEY 로드 완료")
 
 # 2. LLM 정의  (사주 + 점괘 응답용)
 llm = ChatOpenAI(
-    temperature=0.7,
-    model_kwargs={"top_p": 1.0},  # ✅ 이렇게
+    temperature=1.2,
+    #model_kwargs={"top_p": 1.0},  # ✅ 이렇게
+    top_p=0.9, 
     openai_api_key=openai_key,
     model="gpt-4o-mini",
     timeout=25,
@@ -177,17 +141,41 @@ SAJU_COUNSEL_SYSTEM = """
 
 [입력 JSON]
 - saju: 출생 원국 간지 {year, month, day, hour}
-- natal.sipseong_by_pillar: 원국 각 기둥 십성(예: year, month, day, hour)
-- current_daewoon: 현재 대운 {ganji, sipseong?, sibi_unseong?}
-- target_time: 관측 시점(연/월/일/시) {ganji, sipseong?, sibi_unseong?}
-- resolved: (서버에서 정규화해 제공하는 읽기 전용 섹션)
-  - pillars.{year|month|day|hour}: {ganji, stem, branch, sipseong, sibi_unseong?}
-  - flow_now.daewoon: {ganji, sipseong?, sibi_unseong?}
-  - flow_now.target.{year|month|day|hour}: {ganji, sipseong?, sibi_unseong?}
+- natal.sipseong_by_pillar: 출생 원국 각 기둥의 십성 (예: year, month, day, hour)
+- current_daewoon: 현재 대운 정보
+  {
+    ganji,                  # 예: "계해"
+    stem?, branch?,         # ganji 분해값 (예: 천간=계, 지지=해)
+    sipseong?,              # 일간 기준 '천간' 기반 대운 십성 (예: 편인)
+    sipseong_branch?,       # 일간 기준 '지지' 기반 대운 십성 (있으면 권장)
+    sibi_unseong?           # 일간 기준 대운의 십이운성 (예: 절)
+  }
+- target_time: 관측 시점(연/월/일/시)별 운 정보
+  {
+    year|month|day|hour: {
+      ganji,                # 예: "을사"
+      stem?, branch?,       # ganji 분해값 (예: 천간=을, 지지=사)
+      sipseong?,            # 일간 기준 '천간' 기반 십성
+      sipseong_branch?,     # 일간 기준 '지지' 기반 십성
+      sibi_unseong?         # 일간 기준 십이운성
+    }
+  }
+- resolved: 서버에서 정규화해 제공하는 읽기 전용 블록
+  - pillars.{year|month|day|hour}:
+      { ganji, stem, branch, sipseong?, sipseong_branch?, sibi_unseong? }
+  - flow_now.daewoon:
+      { ganji, stem?, branch?, sipseong?, sipseong_branch?, sibi_unseong? }
+  - flow_now.target.{year|month|day|hour}:
+      { ganji, stem?, branch?, sipseong?, sipseong_branch?, sibi_unseong? }
   - canon:
-    - sipseong_vocab: 허용 십성 라벨 집합
-    - sibi_vocab: 허용 십이운성 라벨 집합
-- meta: {focus?, question, summary}
+      - sipseong_vocab: 허용 십성 라벨 집합
+        (예: 비견, 겁재, 식신, 상관, 편재, 정재, 편관, 정관, 편인, 정인)
+      - sibi_vocab: 허용 십이운성 라벨 집합
+        (예: 장생, 목욕, 관대, 건록, 제왕, 쇠, 병, 사, 묘, 절, 태, 양)
+- meta: 메타데이터 { focus?, question, summary }
+- target_times: 비교/다중 시점 배열 [{ label?, scope("year"|"month"|"day"|"hour"), ganji, stem?, branch?, sipseong?, sipseong_branch?, sibi_unseong? }, ...]
+
+
 
 [모드 자동 판별(상호 배타)]
 - SAJU: 질문이 사주/간지/대운/세운/월운/일운/십성 등 해석 의도를 띠거나, saju 데이터가 주어져 있고 질문이 운세·시점·재물·직업 등 “해석 대상”일 때.
@@ -199,45 +187,171 @@ SAJU_COUNSEL_SYSTEM = """
 - COUNSEL/LOOKUP 모드에서는 사주 이론(간지·십성·운성·대운 등) 언급 금지.
 
 [데이터 사용 규약 - 매우 중요]
-- 계산/추정 금지. 입력 JSON만 사용.
-- 십성(sipseong) 읽기 우선순위:
-  1) $.resolved.flow_now.target.{year|month|day|hour}.sipseong
-  2) $.current_daewoon.sipseong
-  3) $.resolved.pillars.{year|month|day|hour}.sipseong
-  (없으면 "데이터 없음"이라고 쓰고 넘어간다.)
-- 십이운성(sibi_unseong) 읽기 우선순위:
-  1) $.resolved.flow_now.target.{year|month|day|hour}.sibi_unseong
-  2) $.current_daewoon.sibi_unseong
-  3) $.resolved.pillars.{year|month|day|hour}.sibi_unseong
-  (없으면 "데이터 없음"이라고 쓰고 넘어간다.)
-- 간지(stem/branch) 언급은 입력 값만 사용. 새로 계산 금지.
-- 용어 고정: 십성/십신 혼용 금지 → 항상 “십성”. 12운성은 “십이운성/운성” 표현 사용.
-- 라벨 집합 고정: 아래 집합 밖 단어 사용 금지.
-  - 십성: $.resolved.canon.sipseong_vocab
-  - 십이운성: $.resolved.canon.sibi_vocab
+- 새 계산/추정 금지. 입력 JSON만 사용한다.
+- 참조 허용 경로(소스 오브 트루스):
+  - $.resolved.flow_now.target.{year|month|day|hour}.{ganji, stem, branch, sipseong, sipseong_branch, sibi_unseong}
+  - $.resolved.flow_now.daewoon.{ganji, stem?, branch?, sipseong?, sipseong_branch?, sibi_unseong?}
+  - $.current_daewoon.{ganji, sipseong?, sipseong_branch?, sibi_unseong?}
+  - $.resolved.pillars.{year|month|day|hour}.{ganji, stem, branch, sipseong?, sipseong_branch?, sibi_unseong?}
+  - $.resolved.canon.{sipseong_vocab, sibi_vocab}
+
+- 용어/라벨 검증(매우 중요):
+  - "십성(sipseong)"과 "십성(지지기준, sipseong_branch)" 값은 모두 $.resolved.canon.sipseong_vocab 안의 라벨이어야 한다.
+    (예: 비견, 겁재, 식신, 상관, 편재, 정재, 편관, 정관, 편인, 정인)
+  - "십이운성(sibi_unseong)" 값은 반드시 $.resolved.canon.sibi_vocab 안의 라벨이어야 한다.
+  - 위 집합에 없는 값(예: "계/해", "乙/巳", 임의 문자열)은 해당 필드가 **"데이터 없음"**인 것으로 간주한다.
+  - 간지(ganji)는 한 쌍(천간+지지)이며, stem/branch는 간지의 분해 값이다. 이 셋은 **서로 대체하지 않는다.**
+  - sipseong = '천간' 기준 십성, sipseong_branch = '지지' 기준 십성으로 구분해 사용한다.
+
+- 읽기 우선순위
+  (1) 십성(sipseong: 천간 기준):
+    1) $.resolved.flow_now.target.{year|month|day|hour}.sipseong
+    2) $.resolved.flow_now.daewoon.sipseong (있고, 유효 라벨일 때만)
+    3) $.current_daewoon.sipseong (있고, 유효 라벨일 때만)
+    4) $.resolved.pillars.{year|month|day|hour}.sipseong
+    (모두 없거나 유효하지 않으면 "데이터 없음"으로 표기하고 넘어간다.)
+  (2) 십성_branch(sipseong_branch: 지지 기준):
+    1) $.resolved.flow_now.target.{year|month|day|hour}.sipseong_branch
+    2) $.resolved.flow_now.daewoon.sipseong_branch (있고, 유효 라벨일 때만)
+    3) $.current_daewoon.sipseong_branch (있고, 유효 라벨일 때만)
+    4) $.resolved.pillars.{year|month|day|hour}.sipseong_branch
+    (모두 없거나 유효하지 않으면 "데이터 없음")
+  (3) 십이운성(sibi_unseong: 지지 기반 운성):
+    1) $.resolved.flow_now.target.{year|month|day|hour}.sibi_unseong
+    2) $.resolved.flow_now.daewoon.sibi_unseong
+    3) $.current_daewoon.sibi_unseong
+    4) $.resolved.pillars.{year|month|day|hour}.sibi_unseong
+    (모두 없으면 "데이터 없음")
+  (4) 간지/천간/지지:
+    - 간지(ganji), stem, branch는 입력에 주어진 값만 사용한다(새 계산 금지).
+    - 우선 $.resolved.flow_now.target.{...}.{ganji, stem, branch}를 사용하고,
+      대운 간지/천간/지지는 $.resolved.flow_now.daewoon 또는 $.current_daewoon에서 사용한다.
+- 서술 규칙(핵심):
+  - 해석 본문에는 연/월/일/시의 **천간 기준 십성(sipseong)**과 **지지 기준 십성(sipseong_branch)**, **십이운성**을 각각 1회 이상 반영한다(해당 값이 있을 때).
+  - 근거 블록에는 JSON 경로를 출력하지 말고,
+    "연운: 간지=을사(乙巳), 천간 십성=상관, 지지 십성=편재, 십이운성=절"처럼 사람이 읽는 요약 형식으로만 쓴다.
+  - 값이 없거나 유효하지 않으면 "데이터 없음"으로 명시한다.
+  - "한 줄 정리"는 전체 해석의 핵심 문장이다. 본문(핵심 흐름/기회/실행 팁/주의점)에서는 이 문장이 왜 나왔는지, 해당 십성·십이운성·대운/세운 구조를 근거로 최소 2~4문장 이상 풀어서 설명한다.
+- 용어 고정:
+  - "십성/십신" 혼용 금지 → 항상 "십성".
+  - 12운성 표기는 "십이운성" 또는 "운성".
+  - 라벨은 $.resolved.canon.*_vocab 밖 단어 사용 금지.
+- [비교 입력 (있으면 사용, 없으면 무시)]
+ - {{comparison_block}}
+
+- [비교 데이터(JSON; 있으면 사용, 없으면 무시)]
+ - {{target_times}}
+
+- 비교 모드: target_times가 2개 이상이면, 해석·근거·표 구성 시 우선적으로 target_times[].{ganji, sipseong, sipseong_branch, sibi_unseong}를 사용한다.
+- 단일/혼합 모드: target_times가 비었거나 1개면, mirror된 legacy($.resolved.flow_now.target / $.target_time)를 사용한다.
+
+[창의 브리프(JSON)]
+{creative_brief}
+
+- 원칙:
+  - 브리프의 angles를 “관점 힌트”로만 쓰고, **판단/점수는 생성하지 말라.**
+  - 같은 의미라도 각 항목(연/월/일/시)은 **다른 각도**로 서술하라(angles 활용).
+  - 첫 단락은 차이를 먼저 말하고, 이어서 사용자가 바로 행동할 수 있는 팁을 제시하라.
+  - 표현 다양화: style_seed={style_seed} 값을 참고해 첫 문장·접속사·동사 선택을 매번 다르게 하라.
+
   
 [출력 형식]
+- 비교 모드일 때: 먼저 간단 비교표/불릿으로 항목별(라벨/간지/천간 십성/지지 십성/십이운성) 요약 후, 결론(어느 쪽이 무엇에 유리)과 이유를 2~3문장으로 제시한다.
 - 첫 줄에 모드 태그를 반드시 출력: [MODE: SAJU] | [MODE: COUNSEL] | [MODE: LOOKUP]
 - SAJU:
-  1) 핵심 흐름(2~3문장; 십신·십이운성 각 1회 이상 언급)
+   1) 핵심 흐름(2~3문장; 십성·십이운성 각 1회 이상 언급)
+      - 가능하면 첫 문장으로 [INTERPRET_COMBO] 결과 1문장을 사용하고, 이어서 **해당 해/월/일/시 운의 전체 흐름을 요약**한다.
+      - 이때 이후에 나올 "한 줄 정리"의 핵심 메시지를 먼저 짧게 언급해 두고, 뒤 항목에서 이를 세부적으로 풀어간다.
   2) 기회 • 2~3개
-  3) 실행 팁 • 2~3개
-  4) 주의점 • 1~2개
-  5) 한 줄 정리(1문장)
-  6) 근거
-     - (참조 경로와 값을 2~4줄, 실제 사용한 것만 명시. 예시)
-     - 십성(월운): $.resolved.flow_now.target.month.sipseong = "편재"
-     - 12운성(월운): $.resolved.flow_now.target.month.sibi_unseong = "건록"
-     - 대운 십성: $.current_daewoon.sipseong = "편인"
+      - 각 항목마다 **어떤 십성/십이운성 구조 때문에 이런 기회가 생기는지**를 1회 이상 언급한다.
+      - 누구에게나 통하는 막연한 조언(예: "네트워킹을 하세요")은 피하고, 해당 운의 특징과 직접 연결된 내용만 쓴다.
+   3) 실행 팁 • 2~3개
+      - 사용자가 바로 행동으로 옮길 수 있을 정도로 구체적으로 적되, "어떤 십성/운성이라서 이런 행동이 유리한지"를 짧게 붙인다.
+      - "전문가 의견 들어라", "시장 동향 분석하라"처럼 모든 사람이 이미 아는 조언 금지.
+      - 반드시 십성/운성 구조가 "어떤 행동을 해야만 하는 이유"를 만들어야 한다.
+      - 예: "정재+양(십이운성) 조합은 '조용하지만 확실한 축적' 패턴이므로 포트폴리오 중 현금흐름이 꾸준한 종목의 비중을 살짝 늘리면 흐름을 최대한 활용할 수 있습니다."
+   4) 주의점 • 1~2개
+      - 이 운에서 **과도하게 드러나기 쉬운 성향(예: 편재 과다, 상관 과다 등)**을 짚고, 이를 어떻게 조절하면 좋은지 제시한다.
+      - 십성의 단점만 말하지 말고, **왜 이 해의 십이운성과 결합할 때 위험이 커지는지** 구조적으로 말한다.
+   
+   5) [한 줄 정리 / 해설 강화 규칙 - 매우 중요]
+    - "한 줄 정리"는 해당 시점(연·월·일·시)의 십성(sipseong), 십성_branch(지지 기준), 
+        십이운성(sibi_unseong), 간지(ganji)의 상호작용을 기반으로 
+        **직업/재물/투자/연애·인간관계 등 질문 주제에 대한 가장 실제적이고 직접적인 평가**를 1문장으로 압축한다.
+        (예: “이 해는 단기 수익 기회가 강하므로 공격적 운용이 유리합니다.”, 
+            “직업적으로는 역할 확장·재배치 흐름이 강하게 들어옵니다.” 등)
+
+    - "한 줄 정리"에는 반드시 다음 중 최소 1개 이상이 포함된다:
+        1) 재물: 수익/손실/변동성/기회·위험도  
+        2) 직업: 이동/변화/확장/압박·책임 증가  
+        3) 인간관계/팀: 갈등/조화/확대/축소  
+        4) 투자: 단기·중기·장기 전략 중 무엇이 유리한지  
+        5) 건강/심리: 과로/소진/안정/호전 등  
+    → 즉, **일상에서 체감 가능한 결과를 반드시 명시**해야 한다.
+
+    - "한 줄 정리 해설"은 2~4문장으로,
+        결론이 나오는 이유를 **십성·십이운성·간지의 구조적 작용을 바탕으로 매우 직설적으로 설명**한다.
+        (원론적/상투적 조언 금지)
+
+    - 해설은 반드시 아래 3단 구성으로 작성한다:
+        ① 어떤 십성/운성이 중심인지 →  
+        ② 그 조합이 어떤 ‘현실적 결과’를 유도하는지 →  
+        ③ 그 결과가 왜 지금 이 질문(직업/주식/재물 등)에 직접적으로 적용되는지  
+
+    - “조심하세요/안정적입니다/좋습니다” 같은 포괄적 설명 금지.
+        대신 “변동성이 커집니다”, “실제 책임이 증가합니다”, “외부 제안이 증가합니다”, 
+        “수익 실현 기회가 잦습니다”, “새 업무 배치 가능성이 높습니다”처럼 구체적 표현을 우선 사용한다.
+
+    - 해설에서는 사주 원리를 현실 흐름에 연결하여 반드시 
+        **결과 지향적 문장**으로 마무리한다.  
+        (예: “따라서 이 시기는 직무 이동·역할 확장 가능성이 매우 높습니다.”,
+            “그래서 단기 기회가 잦아지는 흐름입니다.”)
+   6) 근거
+      - (실제 사용한 값만 2~4줄 내로 명시한다. JSON 경로는 표기하지 않는다.)
+      - 출력 형식(예시; 실제 값으로 대체):
+          - 연운: 간지=乙巳(을사), 천간 십성=상관, 지지 십성=편재, 십이운성=절
+          - 월운: 간지=丙午(병오), 천간 십성=식신, 지지 십성=정재, 십이운성=제왕
+          - 일운: 간지=辛丑(신축), 천간 십성=정재, 지지 십성=편인, 십이운성=쇠
+          - 대운: 간지=癸亥(계해), 천간 십성=편인, 지지 십성=정인, 십이운성=건록
+      - 출력 원칙:
+          - 간지(ganji)는 한 쌍(천간+지지)으로 반드시 함께 표기한다.
+          - 천간 십성(sipseong)과 지지 십성(sipseong_branch)을 구분해 병기한다.
+          - 십이운성(sibi_unseong)이 있으면 반드시 포함한다.
+          - 값이 없거나 미정이면 “데이터 없음”으로 명시한다.
+          - 사람이 읽기 쉽게 문장부호와 한글 병기를 함께 쓴다.
 - COUNSEL: 공감 1문장 + 현실적 제안 2~3문장(사주 언급 금지)
 - LOOKUP: 요청한 값만 간단히 나열(불필요한 해석 없음)
 
 [어조]
 - 따뜻하고 현실적. 장황한 이론 설명 금지. 결과를 바로 쓸 수 있게 간결하게.
+- 단, "한 줄 정리 해설" 블록에서는 누구나 아는 일반론이 아니라, **왜 그런 결론이 나오는지**를 사주 구조를 근거로 차분히 설명한다.
 
 [대화 맥락 연결]
 - {summary}를 확인하고 직전 응답이 SAJU 모드였다면, 후속 질문이 일상적/가벼워도 사주 해석 맥락과 연결해 자연스럽게 이어서 답한다.
 - COUNSEL 모드로 보내야 하는 질문이어도, 사주 기반 조언을 부드럽게 덧붙일 수 있다면 함께 제공해라.
+
+[INTERPRET_COMBO]
+아래 입력으로 십성+십이운성 조합을 1~2문장으로 압축해 생성한다.
+
+- 입력 변수 (체인에서 바인딩됨):
+  - ten_god: $.resolved.flow_now.target[KEY].sipseong         # 예: "상관"
+  - life_stage: $.resolved.flow_now.target[KEY].sibi_unseong   # 예: "절"
+  - timeframe: "연운" | "월운" | "일운" | "시운"               # KEY에 대응하는 한국어 표기
+  - style_hint: "career" | "money" | "love" | "health" | "general"
+
+- 생성 규칙:
+  - 문장 수: 최대 2문장.
+  - 톤: 따뜻·현실·명료. 과장/단정 금지.
+  - 십성·십이운성을 각각 1회 이상 자연스럽게 언급해도 되지만, 과도한 이론 설명 금지.
+  - 날짜/숫자/새 계산/새 라벨 생성 금지.
+  - 예시(상관+절, 연운): "상관의 표현·혁신은 살아나지만 '절(연운)'이라 기존 방식을 끊고 새 판을 짤수록 흐름이 빨라집니다."
+
+- 누락 처리:
+  - ten_god 또는 life_stage가 비어 있으면 빈 문자열("")을 출력한다.
+
+- 힌트(출력에 직접 노출 금지):
+  - 십성 키워드 예: 정인(학습/증빙), 편인(연구/아이디어), 비견(동료/자율), 겁재(경쟁), 식신(실행), 상관(표현/혁신), 정재(현금흐름), 편재(외부기회), 정관(규범/책임), 편관(압박/과제)
+  - 십이운성 키워드 예: 장생(시작), 목욕(변동), 관대(성장), 건록(실권), 제왕(피크), 쇠(둔화), 병(부담), 사(마무리), 묘(휴지), 절(단절/리셋), 태(씨앗), 양(발아)
 
 # ───────── 맥락 강화 규칙(추가) ─────────
 - 반드시 **첫 문장**은 그대로 출력한다: "{bridge}"
@@ -259,6 +373,8 @@ SAJU_COUNSEL_SYSTEM = SAJU_COUNSEL_SYSTEM + """
 - 첫 문장은 바로 **핵심 요약**으로 시작. 불필요한 서두 금지.
 - '출생 원국 년주/월주/일주/시주'는 참조용으로만 사용하고, 제목/첫 문장/첫 문단에는 절대 넣지 말 것. (반드시 타겟 시점 기준으로 작성)
 - 아래 [CONTEXT]/[FACTS]/[BRIDGE]는 참고용으로만 사용하고, **문구를 그대로 답변에 쓰지 말 것**.
+- (SAJU 모드) 가능하면 핵심 흐름의 **첫 문장으로 [INTERPRET_COMBO] 결과 1문장**을 사용하고, 이어서 핵심 요약 문장을 완성한다. (ten_god 또는 life_stage가 비어 있으면 사용하지 않음)
+- (COUNSEL/LOOKUP 모드) [INTERPRET_COMBO] 결과를 사용하지 않는다(사주 용어 노출 금지).
 """
 
 counseling_prompt = ChatPromptTemplate.from_messages([
@@ -351,7 +467,52 @@ schema = {
 }
 #ext_chain = create_extraction_chain(schema=schema, llm=llm2)
 
-# ====== 메모리/히스토리 하이드레이터 ======
+def build_text_summary_from_history(
+    session_id: str,
+    max_messages: int = 20,
+    max_chars: int = 1000,
+) -> str:
+    """
+    RunnableWithMessageHistory 에서 사용하는 동일한 session_id 기준으로
+    최근 히스토리를 텍스트로 단순 요약(=잘라내기)해서 반환.
+
+    - LLM을 추가로 부르지 않음
+    - 최근 max_messages 개만 사용
+    - 최종 길이를 max_chars 안으로 자름
+    """
+    try:
+        history = get_session_history_func(session_id)
+    except Exception as e:
+        print(f"[WARN] build_text_summary_from_history: history load 실패: {e}")
+        return ""
+
+    msgs = getattr(history, "messages", []) or []
+    if not msgs:
+        return ""
+
+    # 최근 max_messages 개만 대상
+    msgs = msgs[-max_messages:]
+
+    lines: list[str] = []
+    for m in msgs:
+        role = getattr(m, "type", getattr(m, "role", "")) or "user"
+        content = getattr(m, "content", "")
+        # content 가 list / dict 인 경우도 방어적으로 처리
+        if isinstance(content, list):
+            # ChatMessage.content 가 여러 Chunk 로 오는 경우 등
+            content = " ".join(
+                c.get("text", "") if isinstance(c, dict) else str(c)
+                for c in content
+            )
+        elif not isinstance(content, str):
+            content = str(content)
+        lines.append(f"{role}: {content}")
+
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[-max_chars:]  # 뒤쪽(max_chars)만 남기기
+
+    return text
 
 # 이미 하이드레이션 했는지(중복 방지) 추적
 _HYDRATED_SESSIONS: set[str] = set()
@@ -448,7 +609,7 @@ def print_summary_state():
     print("\n🧠 현재 global_memory.moving_summary_buffer (요약) 내용:")
     print(f"메모리 내 메시지 수: {len(global_memory.chat_memory.messages)}")
     #print(f"현재 토큰 수 (추정): {len(str(global_memory.chat_memory.messages)) // 4}")
-    print(f"요약 버퍼 내용: {global_memory.moving_summary_buffer}")
+    #print(f"요약 버퍼 내용: {global_memory.moving_summary_buffer}")
 
 def record_turn(user_text: str, assistant_text: str, payload: dict | None = None): 
     """대화 1턴 저장 + LangChain 요약 갱신 + FACTS 병합""" 
@@ -465,18 +626,91 @@ def record_turn(user_text: str, assistant_text: str, payload: dict | None = None
     print("================== record_turn end ==================\n")
     
     
-def _sipseong_for_target(day_stem_hj: str, target_ganji: str | None) -> str | None:
+def _sipseong_split_for_target(day_stem_hj: str, target_ganji: str | None) -> str | None:
+    """일간(day_stem_hj) 기준으로 target의
+    - 천간 십성(= sipseong)
+    - 지지 십성(= sipseong_branch)
+    를 함께 반환한다."""
     if not target_ganji:
+        return None, None
+    t_stem_hj = stem_from_any(target_ganji)
+    t_branch_hj = branch_from_any(target_ganji)
+    
+    ten_god_stem = get_sipshin(day_stem_hj, t_stem_hj) if t_stem_hj else None
+    ten_god_branch = get_ji_sipshin_only(day_stem_hj, t_branch_hj) if t_branch_hj else None
+    
+    if ten_god_stem in ("미정", "없음"): ten_god_stem = None
+    if ten_god_branch in ("미정", "없음"): ten_god_branch = None
+    
+    return ten_god_stem, ten_god_branch
+
+
+
+def style_seed_from_payload(payload: dict) -> int:
+    key = (payload.get("meta", {}).get("question","") +
+           "|" + ",".join([s.get("ganji","") for s in payload.get("target_times", [])]))
+    return int(hashlib.md5(key.encode("utf-8")).hexdigest(), 16) % 10_000
+
+# ── target_times → legacy(target_time, resolved.flow_now.target) 미러 ──
+_TARGET_KEYS = ("ganji", "stem", "branch", "sipseong", "sipseong_branch", "sibi_unseong")
+_SCOPES      = ("year", "month", "day", "hour")
+
+def _as_legacy_slot(entry: dict) -> dict:
+    return {k: (entry.get(k) if entry.get(k) not in ("", None) else None) for k in _TARGET_KEYS}
+
+def mirror_target_times_to_legacy(payload: dict) -> None:
+    """
+    target_times에서 scope별(연/월/일/시) '첫 항목'을 뽑아
+    - payload.target_time (legacy single 구조)
+    - payload.resolved.flow_now.target (해석 경로)
+    에 동기화한다.
+    기존 single 값이 있으면 빈 슬롯만 채운다(보수적 merge).
+    """
+
+    tt = payload.get("target_times") or []
+    if not isinstance(tt, list):
+        tt = []
+
+    # 각 scope의 첫 항목만 legacy에 반영
+    legacy = {s: None for s in _SCOPES}
+    seen = set()
+    for e in tt:
+        scope = e.get("scope")
+        if scope in _SCOPES and scope not in seen:
+            legacy[scope] = _as_legacy_slot(e)
+            seen.add(scope)
+            if len(seen) == len(_SCOPES):
+                break
+
+    # 기존 single이 있으면 비어 있는 슬롯만 채움
+    single = payload.get("target_time") or {s: None for s in _SCOPES}
+    for s in _SCOPES:
+        if single.get(s) is None and legacy.get(s) is not None:
+            single[s] = legacy[s]
+    payload["target_time"] = single
+
+    # resolved.flow_now.target 도 동기화
+    payload.setdefault("resolved", {})
+    payload["resolved"].setdefault("flow_now", {})
+    payload["resolved"]["flow_now"].setdefault("target", {})
+    for s in _SCOPES:
+        slot = payload["target_time"].get(s)
+        payload["resolved"]["flow_now"]["target"][s] = (dict(slot) if slot else None)
+
+
+def _entry_from_known(day_stem_hj, scope: str, g: Optional[str], sip_gan, sip_br, sibi) -> Optional[dict]:
+    if not g:
         return None
-    t_stem_hj   = stem_from_any(target_ganji)    # '戊' 등
-    t_branch_hj = branch_from_any(target_ganji)  # '戌' 등
-    if t_stem_hj:
-        v = get_sipshin(day_stem_hj, t_stem_hj)
-        return None if v == "미정" else v
-    if t_branch_hj:
-        v = get_ji_sipshin_only(day_stem_hj, t_branch_hj)
-        return None if v in ("미정", "없음") else v
-    return None
+    return {
+        "label": {"year":"연운","month":"월운","day":"일운","hour":"시운"}.get(scope, scope),
+        "scope": scope,                # "year" | "month" | "day" | "hour"
+        "ganji": g,
+        "stem":  stem_from_any(g),
+        "branch":branch_from_any(g),
+        "sipseong":        sip_gan,    # 천간 기준 십성
+        "sipseong_branch": sip_br,     # 지지 기준 십성
+        "sibi_unseong":    sibi,       # 지지 기반 십이운성
+    }
 
 def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     """
@@ -527,9 +761,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     # 요약/엔티티 단계에서 쉽게 이용하도록 표준화
     target_ganji_list = [g for g in [t_year_ganji, t_month_ganji, t_day_ganji, t_hour_ganji] if g]
 
-    # 현재 대운 보조 필드: 없으면 None
-    curr_dw_sipseong = f"{currDwGan}/{currDwJi}" if (currDwGan or currDwJi) else None
-    #print(f"target_ganji_list :{target_ganji_list}, curr_dw_sipseong : {curr_dw_sipseong}")   
+    #print(f"target_ganji_list :{target_ganji_list}")   
 
     
     # === 1) 타겟 간지 파싱 후, pillars_unseong로 일괄 계산 ===
@@ -541,91 +773,227 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     }
 
     #  일간(천간) 표준화: 한글/혼합 → 한자(예: '임'→'壬') (★)
-    day_stem_hj = _norm_stem(ilGan)  # ilGan 예: '임' 또는 '壬'
+    day_stem_hj = _norm_stem(ilGan)  # ilGan 예: '임' 또는 '壬' 한자로 변환
 
+    
     # None이 섞여 있어도 pillars_unseong 내부에서 처리됨
+     # 타겟(연/월/일/시) 십이운성 맵
     target_sibi_map = pillars_unseong(day_stem_hj, pillars_branches)
     # 예: {'year': '관대', 'month': '절', 'day': None, 'hour': '장생'}
 
     # === [B] 현재 대운 십이운성 (★ _branch_of → branch_from_any)
+    print(f"current_dw : {current_dw}")
     current_dw_branch = branch_from_any(current_dw)  # 예: '亥' 또는 None
     curr_dw_sibi = unseong_for(day_stem_hj, current_dw_branch) if current_dw_branch else None
     
     print(f"day_stem_hj : {day_stem_hj}, current_dw_branch : {current_dw_branch}, curr_dw_sibi : {curr_dw_sibi}")
     
-    # 타겟(연/월/일/시) 십성 산출 (★ 추가)
-    year_sip  = _sipseong_for_target(day_stem_hj, t_year_ganji)
-    month_sip = _sipseong_for_target(day_stem_hj, t_month_ganji)
-    day_sip   = _sipseong_for_target(day_stem_hj, t_day_ganji)
-    hour_sip  = _sipseong_for_target(day_stem_hj, t_hour_ganji)
-    print(f"year_sip : {year_sip}, month_sip : {month_sip}, day_sip : {day_sip}")
+    # 타겟(연/월/일/시) 십성(천간/지지)
+    year_sip_gan,  year_sip_br = _sipseong_split_for_target(day_stem_hj, t_year_ganji)
+    month_sip_gan, month_sip_br = _sipseong_split_for_target(day_stem_hj, t_month_ganji)
+    day_sip_gan,   day_sip_br = _sipseong_split_for_target(day_stem_hj, t_day_ganji)
+    hour_sip_gan,  hour_sip_br = _sipseong_split_for_target(day_stem_hj, t_hour_ganji)
+    # 대운 십성 계산으로 교체 ✅
+    dw_sip_gan, dw_sip_br = _sipseong_split_for_target(day_stem_hj, current_dw)
+
+    print(f"year_sip_gan : {year_sip_gan}, year_sip_br : {year_sip_br}, month_sip_gan : {month_sip_gan}, month_sip_br : {month_sip_br}")
     # 따옴표 오류 수정(내부 키는 작은따옴표로)
     print(f"target_sibi_map.get(year/month/day) : {target_sibi_map.get('year')}, {target_sibi_map.get('month')}, {target_sibi_map.get('day')}")
 
-    
+    #배열형 target_times 구성(기본 1건 + 비교질문)
+    target_times: List[dict] = []
+
+    # 기본 1건(있을 때만)
+    if t_year_ganji:
+        e = _entry_from_known(day_stem_hj, "year",  t_year_ganji,  year_sip_gan,  year_sip_br,  target_sibi_map.get("year"))
+        if e: target_times.append(e)
+    if t_month_ganji:
+        e = _entry_from_known(day_stem_hj, "month", t_month_ganji, month_sip_gan, month_sip_br, target_sibi_map.get("month"))
+        if e: target_times.append(e)
+    if t_day_ganji:
+        e = _entry_from_known(day_stem_hj, "day",   t_day_ganji,   day_sip_gan,   day_sip_br,   target_sibi_map.get("day"))
+        if e: target_times.append(e)
+    if t_hour_ganji:
+        e = _entry_from_known(day_stem_hj, "hour",  t_hour_ganji,  hour_sip_gan,  hour_sip_br,  target_sibi_map.get("hour"))
+        if e: target_times.append(e)
+
+    # 비교 질문 파싱(간지/연/월/일)
+    specs = parse_compare_specs(updated_question)
+
+    # (a) 간지(예: 甲辰, 乙巳) → 연운으로 간주
+    for gj in (specs.get("ganji_years") or []):
+        if any(e.get("scope") == "year" and e.get("ganji") == gj for e in target_times):
+            continue
+        sip_gan, sip_br = _sipseong_split_for_target(day_stem_hj, gj)
+        entry = {
+            "label": f"{gj} 연운",
+            "scope": "year",
+            "ganji": gj,
+            "stem":  stem_from_any(gj),
+            "branch":branch_from_any(gj),
+            "sipseong":        sip_gan,
+            "sipseong_branch": sip_br,
+            "sibi_unseong":    (unseong_for(day_stem_hj, branch_from_any(gj)) if (day_stem_hj and branch_from_any(gj)) else None),
+        }
+        target_times.append(entry)
+
+    # (b) 연도 숫자(예: 2025, 2026) → 1월 1일 기준 연운
+    for y in (specs.get("years") or []):
+        dt = datetime(y, 1, 1)
+        gj = get_year_ganji_from_json(dt, JSON_PATH)  # JSON_PATH는 상위 스코프/설정에서 참조
+        if not gj: 
+            continue
+        if any(e.get("scope") == "year" and e.get("ganji") == gj for e in target_times):
+            continue
+        sip_gan, sip_br = _sipseong_split_for_target(day_stem_hj, gj)
+        entry = {
+            "label": f"{y}년",
+            "scope": "year",
+            "ganji": gj,
+            "stem":  stem_from_any(gj),
+            "branch":branch_from_any(gj),
+            "sipseong":        sip_gan,
+            "sipseong_branch": sip_br,
+            "sibi_unseong":    (unseong_for(day_stem_hj, branch_from_any(gj)) if (day_stem_hj and branch_from_any(gj)) else None),
+        }
+        target_times.append(entry)
+
+    # (c) 월(YYYY-MM) → 월운
+    for (y, m) in (specs.get("months") or []):
+        dt = datetime(y, m, 1)
+        gj = get_wolju_from_date(dt, JSON_PATH)
+        if not gj:
+            continue
+        sip_gan, sip_br = _sipseong_split_for_target(day_stem_hj, gj)
+        entry = {
+            "label": f"{y}년 {m}월",
+            "scope": "month",
+            "ganji": gj,
+            "stem":  stem_from_any(gj),
+            "branch":branch_from_any(gj),
+            "sipseong":        sip_gan,
+            "sipseong_branch": sip_br,
+            "sibi_unseong":    (unseong_for(day_stem_hj, branch_from_any(gj)) if (day_stem_hj and branch_from_any(gj)) else None),
+        }
+        target_times.append(entry)
+
+    # (d) 일(YYYY-MM-DD) → 일운
+    for (y, m, d) in (specs.get("days") or []):
+        try:
+            dt = datetime(y, m, d)
+        except Exception:
+            continue
+        gj = get_ilju(dt)
+        if not gj:
+            continue
+        sip_gan, sip_br = _sipseong_split_for_target(day_stem_hj, gj)
+        entry = {
+            "label": f"{y}년 {m}월 {d}일",
+            "scope": "day",
+            "ganji": gj,
+            "stem":  stem_from_any(gj),
+            "branch":branch_from_any(gj),
+            "sipseong":        sip_gan,
+            "sipseong_branch": sip_br,
+            "sibi_unseong":    (unseong_for(day_stem_hj, branch_from_any(gj)) if (day_stem_hj and branch_from_any(gj)) else None),
+        }
+        target_times.append(entry)
+
+    # 간단 중복 제거(scope+ganji)
+    seen = set(); dedup = []
+    for e in target_times:
+        key = (e.get("scope"), e.get("ganji"))
+        if key in seen: 
+            continue
+        seen.add(key); dedup.append(e)
+    target_times = dedup
+
     # 최종 스키마 구성
     payload = {
         "saju": {
-            "year": year,
+            "year": year,          # 원국 간지(문자열)
             "month": month,
-            "day": day,          # NOTE: 필요 시 일간/일지 분리 구조로 확장 가능
+            "day": day,            # 필요 시 일간/일지 분리 구조로 확장 가능
             "hour": pillar_hour
         },
         "natal": {
             "sipseong_by_pillar": {
-                "year": yearGan or None,
+                "year": yearGan or None,   # 원국 각 기둥의 '십성' 라벨 (있으면)
                 "month": wolGan or None,
                 "day": ilGan or None,
                 "hour": siGan or None,
             }
         },
+        # === 현재 대운 ===
         "current_daewoon": {
-            "ganji": current_dw or None,          # 문자열(예: '辛酉'), 없으면 None
-            "sipseong": curr_dw_sipseong,        # "간/지" 조합, 없으면 None
-            "sibi_unseong": curr_dw_sibi,          # 계산된 12운성 (없으면 None)
+            "ganji": current_dw or None,                          # 예: "계해"
+            "stem":  stem_from_any(current_dw) if current_dw else None,    # 천간
+            "branch":branch_from_any(current_dw) if current_dw else None,  # 지지
+            "sipseong":        dw_sip_gan,                        # ✅ 일간 기준 '천간' 십성 (예: 편인)
+            "sipseong_branch": dw_sip_br,                         # ✅ 일간 기준 '지지' 십성 (있으면 권장)
+            "sibi_unseong":    curr_dw_sibi,                      # ✅ 일간 기준 '지지' 기반 십이운성
         },
+        # === 타겟 시점(연/월/일/시) ===
         "target_time": {
             "year":  {
-                "ganji": t_year_ganji,
-                "sipseong": year_sip,
-                "sibi_unseong": target_sibi_map.get("year")   # ← ✅ 연 운성
+                "ganji": t_year_ganji,                                        # 예: "을사"
+                "stem":  stem_from_any(t_year_ganji) if t_year_ganji else None,
+                "branch":branch_from_any(t_year_ganji) if t_year_ganji else None,
+                "sipseong":        year_sip_gan,                              # ✅ 천간 기준 십성
+                "sipseong_branch": year_sip_br,                               # ✅ 지지 기준 십성
+                "sibi_unseong":    target_sibi_map.get("year"),               # ✅ 지지 기반 십이운성
             },
             "month": {
                 "ganji": t_month_ganji,
-                "sipseong": month_sip,
-                "sibi_unseong": target_sibi_map.get("month")  # ← ✅ 월 운성
+                "stem":  stem_from_any(t_month_ganji) if t_month_ganji else None,
+                "branch":branch_from_any(t_month_ganji) if t_month_ganji else None,
+                "sipseong":        month_sip_gan,
+                "sipseong_branch": month_sip_br,
+                "sibi_unseong":    target_sibi_map.get("month"),
             },
-            "day":   {
+            "day": {
                 "ganji": t_day_ganji,
-                "sipseong": day_sip,
-                "sibi_unseong": target_sibi_map.get("day")    # ← ✅ 일 운성
+                "stem":  stem_from_any(t_day_ganji) if t_day_ganji else None,
+                "branch":branch_from_any(t_day_ganji) if t_day_ganji else None,
+                "sipseong":        day_sip_gan,
+                "sipseong_branch": day_sip_br,
+                "sibi_unseong":    target_sibi_map.get("day"),
             },
-            "hour":  {
+            "hour": {
                 "ganji": t_hour_ganji,
-                "sipseong": hour_sip,
-                "sibi_unseong": target_sibi_map.get("hour")   # ← ✅ 시 운성
+                "stem":  stem_from_any(t_hour_ganji) if t_hour_ganji else None,
+                "branch":branch_from_any(t_hour_ganji) if t_hour_ganji else None,
+                "sipseong":        hour_sip_gan,
+                "sipseong_branch": hour_sip_br,
+                "sibi_unseong":    target_sibi_map.get("hour"),
             },
         },
+
         "focus": focus,
         "meta": {
             "user_name": user_name,
             "daewoon": daewoon,
             "yinYang": yinYang,
             "fiveElement": fiveElement,
-            "session_id": session_id,           # 필요 시 상위에서 실제 세션 주입
+            "session_id": session_id,      # 필요 시 상위에서 실제 세션 주입
             "question": question,
+
             # 🔥 요약 엔진에서 바로 읽어갈 수 있는 엔티티 블록
             "entities": {
-                "간지": target_ganji_list,
+                "간지": target_ganji_list,   # [연,월,일,시] 중 추출된 간지 목록
                 "타겟_연도": t_year_ganji,
                 "타겟_월": t_month_ganji,
                 "타겟_일": t_day_ganji,
                 "타겟_시": t_hour_ganji,
-                "키워드": [],     # 별도 키워드 추출기로 채울 예정이라면 유지
-                "이벤트": []
+                "키워드": [],                # (옵션) 별도 키워드 추출기로 채움
+                "이벤트": []                 # (옵션)
             }
-        }        
+        }
     }
+    payload["target_times"] = target_times
+    mirror_target_times_to_legacy(payload)
+    #print(f"compare_items : {compare_items}, target_times : {target_times}")
+    
     
      # === E) 정규화 블록(resolved) 추가: 모델은 여기만 보면 됨 ===
     def _stem(g):   return g[0] if isinstance(g, str) and len(g) >= 1 else None
@@ -638,28 +1006,59 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         "hour":  {"ganji": pillar_hour or None, "stem": _stem(pillar_hour), "branch": _branch(pillar_hour), "sipseong": None, "sibi_unseong": None},
     }
 
+    # 기존 보유 헬퍼 재사용
+    # stem_from_any("乙巳") -> "乙", branch_from_any("乙巳") -> "巳"
     payload["resolved"] = {
         "pillars": resolved_pillars,
         "flow_now": {
             "daewoon": {
                 "ganji": current_dw or None,
-                "sipseong": None,             # 현재 대운의 십성 라벨이 없으므로 None
-                "sibi_unseong": curr_dw_sibi, # 계산된 12운성
+                "stem":  stem_from_any(current_dw)   if current_dw else None,
+                "branch":branch_from_any(current_dw) if current_dw else None,
+                "sipseong":        dw_sip_gan,   # ✅ 대운 '천간' 기준 십성
+                "sipseong_branch": dw_sip_br,    # ✅ 대운 '지지' 기준 십성 (신규)
+                "sibi_unseong":    curr_dw_sibi, # 대운 십이운성 (지지 기반)
             },
             "target": {
-                "year":  {"ganji": t_year_ganji,  "sipseong": year_sip,  "sibi_unseong": target_sibi_map.get("year")},
-                "month": {"ganji": t_month_ganji, "sipseong": month_sip, "sibi_unseong": target_sibi_map.get("month")},
-                "day":   {"ganji": t_day_ganji,   "sipseong": day_sip,   "sibi_unseong": target_sibi_map.get("day")},
-                "hour":  {"ganji": t_hour_ganji,  "sipseong": hour_sip,  "sibi_unseong": target_sibi_map.get("hour")},
+                "year":  {
+                    "ganji":   t_year_ganji,
+                    "stem":    stem_from_any(t_year_ganji)   if t_year_ganji else None,
+                    "branch":  branch_from_any(t_year_ganji) if t_year_ganji else None,
+                    "sipseong":        year_sip_gan,    # ✅ 연운 '천간' 기준 십성
+                    "sipseong_branch": year_sip_br,     # ✅ 연운 '지지' 기준 십성 (신규)
+                    "sibi_unseong":    target_sibi_map.get("year"),
+                },
+                "month": {
+                    "ganji":   t_month_ganji,
+                    "stem":    stem_from_any(t_month_ganji)   if t_month_ganji else None,
+                    "branch":  branch_from_any(t_month_ganji) if t_month_ganji else None,
+                    "sipseong":        month_sip_gan,   # ✅ 월운 '천간' 기준 십성
+                    "sipseong_branch": month_sip_br,    # ✅ 월운 '지지' 기준 십성 (신규)
+                    "sibi_unseong":    target_sibi_map.get("month"),
+                },
+                "day":   {
+                    "ganji":   t_day_ganji,
+                    "stem":    stem_from_any(t_day_ganji)   if t_day_ganji else None,
+                    "branch":  branch_from_any(t_day_ganji) if t_day_ganji else None,
+                    "sipseong":        day_sip_gan,     # ✅ 일운 '천간' 기준 십성
+                    "sipseong_branch": day_sip_br,      # ✅ 일운 '지지' 기준 십성 (신규)
+                    "sibi_unseong":    target_sibi_map.get("day"),
+                },
+                "hour":  {
+                    "ganji":   t_hour_ganji,
+                    "stem":    stem_from_any(t_hour_ganji)   if t_hour_ganji else None,
+                    "branch":  branch_from_any(t_hour_ganji) if t_hour_ganji else None,
+                    "sipseong":        hour_sip_gan,    # ✅ 시운 '천간' 기준 십성
+                    "sipseong_branch": hour_sip_br,     # ✅ 시운 '지지' 기준 십성 (신규)
+                    "sibi_unseong":    target_sibi_map.get("hour"),
+                },
             }
         },
-        # 앱 표준에 맞춰 필요 시 조정
         "canon": {
-            "sipseong_vocab": ["비견","겁재","식신","상관","편재","정재","편관","정관","편인","정인","본체(편인)"],
-            "sibi_vocab": ["양","욕","대극","건록","제왕","쇠","병","사","묘","절","태","양(재생)"]
+            "sipseong_vocab": ["비견","겁재","식신","상관","편재","정재","편관","정관","편인","정인"],
+            "sibi_vocab":     ["장생","목욕","관대","건록","제왕","쇠","병","사","묘","절","태","양"]
         }
     }
-    
 
     return payload
 
@@ -670,10 +1069,14 @@ def is_fortune_query(text: str) -> bool:
     t = (text or "").strip()
     return any(k in t for k in FORTUNE_KEYS)
 
+# 이미 갖고 있는 것들: 
+# - get_extract_chain()
+# - _today()
+# - convert_relative_time(...)
+# - _maybe_override_target_date(...)
 
-# # --- (B) 메타 추출 및 시간 변환 로직 함수 ---
 def extract_meta_and_convert(question: str) -> tuple[dict, str]:
-    """메타 추출 + (프롬프트는 그대로) 상대시간 → 절대/간지 치환까지 한 번에.
+    """메타 추출 + 상대시간 → 절대/간지 치환까지 한 번에.
     반환: (parsed_meta(dict), updated_question(str))
     """
     # 1) LLM 메타 추출
@@ -692,7 +1095,7 @@ def extract_meta_and_convert(question: str) -> tuple[dict, str]:
             print(f"[META] 예외 → 빈 메타 사용: {e}")
             parsed = {}
 
-    # 2) 누락 보정
+    # 2) 기본 필드 보정
     parsed.setdefault("msg_keywords", [])
     parsed.setdefault("target_date", None)
     parsed.setdefault("time", None)
@@ -700,48 +1103,49 @@ def extract_meta_and_convert(question: str) -> tuple[dict, str]:
     parsed.setdefault("notes", "")
     parsed.setdefault("_facts", {})
 
-    # 3) target_date 보강(프롬프트 수정 없이 여기서만 처리)
-    #    - LLM이 넣어주면 그대로 둠
-    #    - 없으면 질문에서 ISO 또는 한글 절대일 추출
-    print(f"parsed[\"target_date\"] : {parsed["target_date"]}")
+    # 3) target_date 채우기 (절대 안전)
+    #    - LLM이 채워줬다면 그대로 둠
+    #    - 없으면 한국어/ISO 패턴을 안전 파서로만 처리 (절대 int(None) 금지)
     if not parsed["target_date"]:
-        m_iso = ISO_DATE_RE.search(question)
-        if m_iso:
-            parsed["target_date"] = m_iso.group(0)
-            parsed["_facts"]["deixis_anchor_date"] = {
-                "value": parsed["target_date"], "source": "iso_in_text"
-            }
-            print(f"[DEIXIS] ISO 날짜 감지 → target_date={parsed['target_date']}")
-        else:
-            now = _today()
-            print(f"[TIME] today={now.isoformat()}")
-            m_kor = KOR_ABS_DATE_RE.search(question)
-            if m_kor:
-                mm, dd = int(m_kor.group(1)), int(m_kor.group(2))
-                # 연도 추정은 필요한 정책으로 보강하세요(올해 기준 등)
-                yyyy = now.year
-                try:
-                    parsed["target_date"] = date(yyyy, mm, dd).isoformat()
-                    parsed["_facts"]["deixis_anchor_date"] = {
-                        "value": parsed["target_date"], "source": "korean_abs"
-                    }
-                    print(f"[DEIXIS] 한글 절대일 감지 → target_date={parsed['target_date']}")
-                except Exception as e:
-                    print(f"[DEIXIS] 한글 절대일 보정 실패: {e}")
+        today = _today()
+        # 3-1) 한국어/일반 패턴 파싱
+        y, m, d = parse_korean_date_safe(question)
 
-    # 4) 상대시간 치환: expressions에 **항상 질문 원문을 포함**
-    #    (이 한 줄이 핵심입니다)
+        iso_str = None
+        if y is not None and m is not None and d is not None:
+            # 연/월/일 모두 있으면 그대로
+            try:
+                iso_str = date(y, m, d).isoformat()
+            except Exception as e:
+                print(f"[DEIXIS] 년월일 조합 실패: {e}")
+
+        elif m is not None and d is not None:
+            # 연도가 없으면 올해로 보정(정책적으로 today.year 사용)
+            try:
+                iso_str = date(today.year, m, d).isoformat()
+            except Exception as e:
+                print(f"[DEIXIS] 월일→올해 보정 실패: {e}")
+
+        if iso_str:
+            parsed["target_date"] = iso_str
+            parsed["_facts"]["deixis_anchor_date"] = {
+                "value": iso_str,
+                "source": "korean_abs_or_mmdd"
+            }
+            print(f"[DEIXIS] target_date 확정 → {iso_str}")
+
+    # 4) 상대시간 치환: expressions에 **질문 원문을 반드시 포함**
     today = _today()
     cy, cm, cd = today.year, today.month, today.day
-    # msg_keywords + 질문 원문(중복 제거)
     expressions = list(dict.fromkeys((parsed.get("msg_keywords") or []) + [question]))
+
+    # target_date를 내부 정책(예: '이번주', '다음달')로 덮어쓸 수 있는 후처리
     _maybe_override_target_date(question, parsed, today)
-    
-    
+
     try:
         abs_kws, updated_q = convert_relative_time(
             question=question,
-            expressions=expressions,   # ← 여기!
+            expressions=expressions,
             current_year=cy,
             current_month=cm,
             current_day=cd,
@@ -752,9 +1156,8 @@ def extract_meta_and_convert(question: str) -> tuple[dict, str]:
 
     parsed["absolute_keywords"] = abs_kws
     parsed["updated_question"] = updated_q
-    
-    return parsed, updated_q
 
+    return parsed, updated_q
 
 # 5. Firebase 함수 엔드포인트
 @https_fn.on_request(memory=4096, timeout_sec=120)
@@ -850,6 +1253,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 headers={"Content-Type": "application/json; charset=utf-8"}
             )
 
+
         # --- 세션 보장 & 하이드레이션(앱 재실행 시 과거 대화 복원) ---
         session_id = data.get("session_id") or "single_global_session"
         session_id = ensure_session(session_id, title="사주 대화")
@@ -879,49 +1283,49 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         print(f"년주: {year} 월주: {month}")
         print(f"❓ 질문: {question} {updated_question}")
         
-        
-        # print("===========================테스트 코드 ===============================")
+        {
+            # print("===========================테스트 코드 ===============================")
 
-        # pu = pillars_unseong('壬', pillars)
-        # print(f"🧪 예시) {ilGan}'壬' 일간에게 2025년 巳(사)는 어떤 운성?")
-        # print(f"👉 결과: {unseong_for('임', '사')}")   # '관대'       
-        
+            # pu = pillars_unseong('壬', pillars)
+            # print(f"🧪 예시) {ilGan}'壬' 일간에게 2025년 巳(사)는 어떤 운성?")
+            # print(f"👉 결과: {unseong_for('임', '사')}")   # '관대'       
+            
 
-        # # 2) 내 사주 기둥 운성 일괄
-        # pillars = {'year':'辰', 'month':'巳', 'day':'申', 'hour':'酉'}
-        # pu = pillars_unseong('壬', pillars)
-        # print(f"🧩 기둥 운성: {pu}")
-        
-        # print(f"🧪 예시) 갑목(甲) 일간의 '제왕' 지지는?")
-        # print(f"👉 결과: {branch_for('갑', '제왕')}")   # '묘'
+            # # 2) 내 사주 기둥 운성 일괄
+            # pillars = {'year':'辰', 'month':'巳', 'day':'申', 'hour':'酉'}
+            # pu = pillars_unseong('壬', pillars)
+            # print(f"🧩 기둥 운성: {pu}")
+            
+            # print(f"🧪 예시) 갑목(甲) 일간의 '제왕' 지지는?")
+            # print(f"👉 결과: {branch_for('갑', '제왕')}")   # '묘'
 
-        # # 3) 세운만 빠르게
-        # print(f"📆 세운(巳) 운성: {seun_unseong('壬', '巳')}")
-        
-        # input_date = datetime(1988, 7, 16)  # 예: 양력 2025년 5월 28일
-        # year_ganji = get_year_ganji_from_json(input_date, JSON_PATH)
-        # print(f"년주: {year_ganji}")
+            # # 3) 세운만 빠르게
+            # print(f"📆 세운(巳) 운성: {seun_unseong('壬', '巳')}")
+            
+            # input_date = datetime(1988, 7, 16)  # 예: 양력 2025년 5월 28일
+            # year_ganji = get_year_ganji_from_json(input_date, JSON_PATH)
+            # print(f"년주: {year_ganji}")
 
-        # wolju_ = get_wolju_from_date(input_date, JSON_PATH)
-        # print(f"월주: {wolju_}")
+            # wolju_ = get_wolju_from_date(input_date, JSON_PATH)
+            # print(f"월주: {wolju_}")
 
-        # ilju_ = get_ilju(input_date, JSON_PATH)
-        # print(f"일주: {ilju_}")
-        
-        # tempDaewoon = data.get("currentDaewoon", "").strip().strip('"')
-        # print(f"일간 :{ilju_[0]},  현재 대운 일간 : {tempDaewoon}/{tempDaewoon[0]}")
+            # ilju_ = get_ilju(input_date, JSON_PATH)
+            # print(f"일주: {ilju_}")
+            
+            # tempDaewoon = data.get("currentDaewoon", "").strip().strip('"')
+            # print(f"일간 :{ilju_[0]},  현재 대운 일간 : {tempDaewoon}/{tempDaewoon[0]}")
 
 
-        # sipshin_result = get_sipshin(ilju_[0], tempDaewoon[0])  # 예: 일간=甲, 타간=丙
-        # print(f"'{ilju_[0]}' 기준으로 '{tempDaewoon[0]}'의 십신은 → {sipshin_result}")
-        # print(f"십신: {sipshin_result}")  # 결과: 겁재 또는 비견
+            # sipshin_result = get_sipshin(ilju_[0], tempDaewoon[0])  # 예: 일간=甲, 타간=丙
+            # print(f"'{ilju_[0]}' 기준으로 '{tempDaewoon[0]}'의 십신은 → {sipshin_result}")
+            # print(f"십신: {sipshin_result}")  # 결과: 겁재 또는 비견
 
-        # sipshin_Jiresult = get_ji_sipshin_only(ilju_[0], tempDaewoon[1])  # 일간=甲, 지지=午 → 지장간의 마지막 '丁'
-        # print(f"'{ilju_[0]}' 기준으로 '{tempDaewoon[1]}'의 십신은 → {sipshin_Jiresult}")
-        # print(f"지지 기반 십신: {sipshin_Jiresult}")  # 결과: 편인 (예시)
+            # sipshin_Jiresult = get_ji_sipshin_only(ilju_[0], tempDaewoon[1])  # 일간=甲, 지지=午 → 지장간의 마지막 '丁'
+            # print(f"'{ilju_[0]}' 기준으로 '{tempDaewoon[1]}'의 십신은 → {sipshin_Jiresult}")
+            # print(f"지지 기반 십신: {sipshin_Jiresult}")  # 결과: 편인 (예시)
 
-        print("===============================================================")
-        
+            print("===============================================================")
+        }
          # 현재 연도/월 기준으로 변환
        
         {
@@ -1095,27 +1499,63 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             print(f"*******SAJU_COUNSEL_SYSTEM 분기")
             summary_text = global_memory.moving_summary_buffer or ""
 
-            # 기존 데이터에서 테스트용 스키마 구성 (target_time 값 있으면 채워서 전달)
-            # 병오/기축 테스트가 필요한 경우, req JSON에 아래 키들을 함께 넣어보면 됨:
-            # target_year_ganji, target_year_sipseong, target_year_unseong,
-            # target_month_ganji, target_month_sipseong, target_month_unseong
             focus = data.get("focus") or "종합운"
 
-            # ── 사용자 페이로드 구성 (3인자 버전 권장) ─────────────────────────────
-            # make_saju_payload 시그니처가 4인자(absolute_keywords 포함)라면 여기에 absolute_keywords를 추가하거나,           
+
             user_payload = make_saju_payload(data, focus, updated_question)
+            # → prompt 호출 시 {comparison_block}에 주입
+
+            #비교 블록 만들기
+            #    - target_times가 존재하면 우선 사용
+            #    - 없으면 legacy(resolved.flow_now.target 또는 target_time)에서 1건이라도 가져와 최소 비교/근거 형태 유지
+            try:
+                slices = extract_comparison_slices(user_payload)  # 내부에서 payload["target_times"] 우선 사용하도록 구현됨
+            except Exception as e:
+                print(f"[WARN] extract_comparison_slices 실패: {e}")
+                slices = []
+
+            if not slices:
+                print("not slices")
+                # ---- Fallback: legacy 단일 타겟에서 한 건이라도 꺼내서 최소 정보 구성 ----
+                legacy = (user_payload.get("resolved", {})
+                                        .get("flow_now", {})
+                                        .get("target", {}))
+                if not legacy:
+                    legacy = user_payload.get("target_time", {}) or {}
+                picked = None
+                for scope in ("year","month","day","hour"):
+                    slot = legacy.get(scope)
+                    if slot and any(slot.get(k) for k in ("ganji","sipseong","sipseong_branch","sibi_unseong")):
+                        picked = {
+                            "label": {"year":"연운","month":"월운","day":"일운","hour":"시운"}.get(scope, scope),
+                            "scope": scope,
+                            "ganji": slot.get("ganji"),
+                            "stem": slot.get("stem"),
+                            "branch": slot.get("branch"),
+                            "sipseong": slot.get("sipseong"),
+                            "sipseong_branch": slot.get("sipseong_branch"),
+                            "sibi_unseong": slot.get("sibi_unseong"),
+                        }
+                        break
+                slices = [picked] if picked else []
+
+            # 문자열 블록 (프롬프트에 바로 꽂기)
+            comparison_block = format_comparison_block(slices) if slices else ""
 
             # [NEW] payload에 사용자 정보가 없으면 주입
             if "user" not in user_payload:
                 user_payload["user"] = {"name": user_name, "birth": user_birth}
-                
+            
+            creative_brief = build_creative_brief(user_payload, updated_question)
+            style_seed = style_seed_from_payload(user_payload)
+
             chain = counseling_prompt | ChatOpenAI(
-                temperature=0.6, 
+                temperature=0.7, 
                 #model_kwargs={"top_p": 0.9},
                 top_p = 0.9,
                 openai_api_key=openai_key,                
                 model="gpt-4o-mini",
-                max_tokens=400,
+                max_tokens=600,
                 timeout=20,           # 25초 내 못 받으면 예외
                 max_retries=2,        # 재시도 안 함 (지연 방지)
             )
@@ -1129,6 +1569,12 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             
             # [중요] 사용자 메시지 기록(+메타 자동추출) — 같은 사용자 파일에 기록됨
             session_id = ensure_session(session_id, title="사주 대화")
+
+            #max_history 결정 (클라이언트에서 보내면 그 값, 아니면 기본값)
+            try:
+                max_history = int(data.get("max_history") or MAX_TURNS)
+            except (TypeError, ValueError):
+                max_history = MAX_TURNS
             
             # [중요] 사용자 메시지 기록(+메타 자동추출)
             record_turn_message(
@@ -1149,18 +1595,26 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             bridge_text = _make_bridge(reg_dbg.get("facts", {}))
             facts_json   = json.dumps(reg_dbg.get("facts", {}), ensure_ascii=False)            
           
+            
             result = chat_with_memory.invoke(
                 {
                     "context": reg_prompt,                              # 회귀/컨텍스트 전문
                     "facts": facts_json,                                # 구조화 FACT
                     "summary": summary_text,                            # moving_summary_buffer
                     "question": effective_question,         # 히스토리 키
-                    "bridge": bridge_text,                              # ★ 첫 문장 강제
+                    "bridge": bridge_text,                             # ★ 첫 문장 강제
                     "payload": json.dumps(user_payload, ensure_ascii=False),
+                    # ★ 비교 전용 추가 파라미터
+                    "comparison_block": comparison_block,               # 사람이 읽을 요약 문자열
+                    "target_times": user_payload.get("target_times", []),# 원본 배열(모델이 표/비교 생성용으로 사용)
+
+                    "creative_brief": json.dumps(creative_brief, ensure_ascii=False),  # ★ 추가
+                    "style_seed": style_seed, 
                 },
                 config={"configurable": {"session_id": session_id}},
             )
             answer_text = getattr(result, "content", str(result))
+            #print(f"counseling_prompt : {counseling_prompt}")
             #print(f"result: {result}") openAI 응답 출력
             
             # 메모리 저장(옵션)
@@ -1176,6 +1630,16 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 auto_meta=False,
                 payload=user_payload,
             )
+
+            # 👇 여기서 세션 히스토리를 max_history 개까지만 유지
+            try:
+                print(f"[DBG] trim-call: data.max_history={data.get('max_history')} MAX_TURNS={MAX_TURNS} → using max_history={max_history}")
+                trimmed = trim_session_history(session_id, max_history)
+                if trimmed:
+                    print(f"[TRIM] session_id={session_id} 에 대해 히스토리 잘라냄 (max={max_history})")
+            except Exception as te:
+                print(f"[TRIM] trim_session_history 예외: {te}")
+                
             
             return https_fn.Response(
                 response=json.dumps({"answer": result.content}, ensure_ascii=False),

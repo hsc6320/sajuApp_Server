@@ -228,3 +228,9 @@ def _json_year_bounds(json_path: str) -> tuple[int, int]:
     # 양력기준일이 오름차순/내림차순 어떤 상태든 안전하게 min/max 계산
     years = [datetime.strptime(e["양력기준일"], "%Y-%m-%d").year for e in data]
     return min(years), max(years)
+
+
+from datetime import datetime
+from typing import Optional, Literal
+
+Scope = Literal["year", "month", "day", "hour"]

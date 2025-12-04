@@ -6,7 +6,19 @@ import os, re, json, unicodedata, hashlib
 import os, os.path as p
 from contextlib import contextmanager
 from contextvars import ContextVar
-from google.cloud import storage  # GCS 삭제용
+from google.cloud import storage
+
+
+
+# 유지할 최대 턴 개수 (user↔assistant 한 번 주고받은 것을 2턴으로 저장 중이면,
+# 이 값 기준으로 잘려 나감)
+# 지금 구조에서 MAX_TURNS는 메시지(턴) 개수 기준이고,
+# 질문 1개 + 답변 1개 = 2턴이니까
+# 저장 가능한 Q/A 쌍 수 = MAX_TURNS / 2
+# 따라서:
+# MAX_TURNS = 10 → 10 ÷ 2 = 5쌍
+# MAX_TURNS = 100 → 100 ÷ 2 = 50쌍
+MAX_TURNS = 30
 
 chatJsonFilePath  = ""
 def _parse_gs_path(gs_path: str) -> tuple[str, str]:
@@ -249,18 +261,34 @@ def delete_current_user_store() -> bool:
         return False
     return delete_user_store_by_id(uid)
 
+# def _max_turns() -> int:
+#     raw = os.getenv("CONVO_MAX_TURNS", "10")  # 기본 10
+#     try:
+#         val = int(str(raw).strip())
+#     except Exception:
+#         print(f"[TRIM][CONF] invalid CONVO_MAX_TURNS='{raw}', fallback=10")
+#         val = 10
+#     # 최소 10 보장
+#     limit = max(10, val)
+#     #print(f"[TRIM][CONF] CONVO_MAX_TURNS raw='{raw}' -> resolved={limit}")
+#     return limit
 def _max_turns() -> int:
-    raw = os.getenv("CONVO_MAX_TURNS", "10")  # 기본 10
+    """
+    기존: env 없으면 무조건 10 → 1차 트림이 10턴으로 고정되는 버그 원인
+    수정: env 없으면 DEFAULT_MAX_TURNS 사용, 최소값도 2만 보장
+    """
+    raw = os.getenv("CONVO_MAX_TURNS")
+    if raw is None or str(raw).strip() == "":
+        return MAX_TURNS
+
     try:
         val = int(str(raw).strip())
     except Exception:
-        print(f"[TRIM][CONF] invalid CONVO_MAX_TURNS='{raw}', fallback=10")
-        val = 10
-    # 최소 10 보장
-    limit = max(10, val)
-    #print(f"[TRIM][CONF] CONVO_MAX_TURNS raw='{raw}' -> resolved={limit}")
-    return limit
+        print(f"[TRIM][CONF] invalid CONVO_MAX_TURNS='{raw}', fallback={MAX_TURNS}")
+        val = MAX_TURNS
 
+    # 최소 2턴은 보장 (user/assistant 1쌍이 2턴)
+    return max(2, val)
     
 def _trim_session_turns(db: dict, session_id: str, *, max_turns: int | None = None) -> int:
     """
@@ -288,3 +316,160 @@ def _trim_session_turns(db: dict, session_id: str, *, max_turns: int | None = No
 
     #print(f"[TRIM] session='{session_id}' before={before} removed={removed} kept={len(kept)} limit={limit}")
     return removed
+
+
+def _resolve_store_path() -> str:
+    """
+    [변경점]
+    - _CUR_USER_ID(현재 사용자 컨텍스트)가 설정되어 있으면
+      '그 사용자 전용 파일 경로'를 반환.
+    - 설정되지 않았으면 기존 전역(conversations.json) 경로 유지.
+    """
+    #uid = _CUR_USER_ID.get()
+    uid = get_current_user_id()
+    if uid:
+        path = _resolve_store_path_for_user(uid)
+     #   print(f"[PATH] user={uid} → {path}")        //[PATH] user=김지은__19880716 → gs://chatsaju-5cd67-convos/김지은__19880716.json
+        return path
+    
+    # (전역 파일로 저장하는 *레거시* 경로 — 사용자 미지정 요청 전용)
+    in_cloud = bool(os.getenv("K_SERVICE") or os.getenv("FUNCTION_TARGET") or os.getenv("FIREBASE_CONFIG"))
+    if in_cloud:
+        bucket = os.getenv("GCS_BUCKET")
+        if not bucket:
+            # 기본값('your-project-id.appspot.com') 절대 쓰지 않음
+            print(f"GCS_BUCKET = {bucket}")
+            raise RuntimeError("GCS_BUCKET not set. 예: GCS_BUCKET=chatsaju-5cd67-convos")
+        path = f"gs://{bucket}/user_id.json"
+        print(f"[PATH] (legacy global) Cloud → {path}")
+        return path
+    
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(current_dir, "conversations.json")
+    print(f"[PATH] (legacy global) Local → {path}")
+    return path
+
+
+def _gcs_read_text(gs_path: str) -> str:
+    bucket, name = _parse_gs_path(gs_path)
+    client = storage.Client()
+    bkt = client.bucket(bucket)
+    blob = bkt.blob(name)
+    if not blob.exists(client):
+        raise FileNotFoundError(gs_path)
+    return blob.download_as_text(encoding="utf-8", timeout=10)
+
+def _gcs_write_text(gs_path: str, text: str) -> None:
+    bucket, name = _parse_gs_path(gs_path)
+    client = storage.Client()
+    bkt = client.bucket(bucket)
+    blob = bkt.blob(name)
+    blob.cache_control = "no-store"
+    blob.content_type = "application/json"
+    blob.upload_from_string(text, content_type="application/json", timeout=10)
+    #print(f"[JSON-SAVE] GCS {gs_path} 저장 완료 (size={len(text)} bytes)")
+
+
+def _db_save(db: dict) -> None:
+    path = _resolve_store_path()
+    payload = json.dumps(db, ensure_ascii=False, indent=2)
+    #print(f"path : {path}, payload : {payload}") // payload: 모든 대화내용 출력 , path :  gs://chatsaju-5cd67-convos/conversations.json
+    if _is_gs_path(path):
+        _gcs_write_text(path, payload)
+    else:
+        # (B) 로컬 원자적 쓰기: <file>.tmp → replace
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp, path)
+
+    # 진단용: 총 턴 수 출력
+    sessions = db.get("sessions", {})
+    turns = 0
+    if isinstance(sessions, dict):
+        for s in sessions.values():
+            turns += len(s.get("turns", []))
+    #print(f"[JSON-SAVE] {path} 저장 완료 (세션 수: {len(sessions)}, 총 턴 수: {turns})")       #저장 로그: 
+
+
+def _db_load() -> dict:    
+    path = _resolve_store_path()
+    #print(f"[PATH] {_resolve_store_path.__name__} → {path}")       //[PATH] _resolve_store_path → gs://chatsaju-5cd67-convos/김지은__19880716.json
+    
+    try:
+        if _is_gs_path(path):
+            raw = _gcs_read_text(path)
+            db = json.loads(raw)
+        else:
+            with open(path, "r", encoding="utf-8") as f:
+                db = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        print(f"[JSON-LOAD] {path} 없음/비어있음 → 새 DB 구조 생성")
+        db = {"version": 1, "sessions": {}}
+        # (A) 사용자 컨텍스트가 잡혀 있으면 user 메타 주입
+        try:
+            # conv_store.set_current_user_context() 를 쓰는 구조라면:
+            uid = globals().get("_CUR_USER_ID", None)
+            um  = globals().get("_CUR_USER_META", None)
+            if uid and um:
+                db["user"] = {"id": uid, **um}
+        except Exception:
+            pass
+
+    # list → dict 마이그레이션 유지
+    sess = db.get("sessions")
+    if isinstance(sess, list):
+        new_sessions = {}
+        for s in sess:
+            sid = (s.get("meta") or {}).get("session_id") or s.get("id") or f"migrated_{len(new_sessions)+1}"
+            new_sessions[sid] = s
+        db["sessions"] = new_sessions
+    if "sessions" not in db or not isinstance(db["sessions"], dict):
+        db["sessions"] = {}
+    return db
+
+
+
+def trim_session_history(session_id: str, max_turns: int = MAX_TURNS) -> bool:
+    """
+    db["sessions"][session_id]["turns"] 길이가 max_turns 를 넘으면
+    뒤에서 max_turns 개만 남기고 앞은 잘라낸다(밀어내기).
+    성공적으로 잘랐으면 True, 변화가 없으면 False 반환.
+    """
+    
+
+    try:
+        db = _db_load()
+    except Exception as e:
+        print(f"[TRIM] _db_load 실패: {e}")
+        return False
+
+    sessions = db.get("sessions") or {}
+    sess = sessions.get(session_id)
+    if not sess:
+        print(f"[TRIM] 세션 없음: {session_id}")
+        return False
+
+    turns = sess.get("turns")
+    if not isinstance(turns, list):
+        print(f"[TRIM] turns 타입이 list 아님: {type(turns)}")
+        return False
+    
+    print(f"[DBG] trim-start: session_id={session_id}, len={len(turns)} max_turns={max_turns}")
+
+    if len(turns) <= max_turns:
+        # 자를 필요 없음
+        return False
+
+    # 최근 max_turns 개만 남기기 (밀어내기)
+    new_turns = turns[-MAX_TURNS:]
+    sess["turns"] = new_turns
+
+    try:
+        _db_save(db)
+        print(f"[TRIM] 세션 {session_id} turn {len(turns)}→{len(new_turns)} 로 잘라냄 (max={max_turns})")
+        return True
+    except Exception as e:
+        print(f"[TRIM] _db_save 실패: {e}")
+        return False

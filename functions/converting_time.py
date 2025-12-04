@@ -498,3 +498,39 @@ def extract_target_ganji_v2(updated_question: str
 
     return year, month, day, hour
 
+
+# utils/date_parse_ko.py (새 파일로 두거나 main.py 상단에 넣어도 됨)
+def _to_int(s: Optional[str]) -> Optional[int]:
+    try:
+        return int(s) if s is not None else None
+    except Exception:
+        return None
+
+def parse_korean_date_safe(text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """
+    '1988년 11월 22일', '1988년11월22일', '11월22일', '11월 22일' 등 다양한 표기를 파싱.
+    없으면 None 반환. int(None) 호출을 절대 하지 않도록 보장.
+    """
+    t = text or ""
+
+    # 1) 년-월-일 완전표기 (공백 유무 허용)
+    m = re.search(r'(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일', t)
+    if m:
+        return (_to_int(m.group(1)), _to_int(m.group(2)), _to_int(m.group(3)))
+
+    # 2) yyyy.mm.dd / yyyy-mm-dd / yyyy/mm/dd
+    m = re.search(r'(\d{4})[./-](\d{1,2})[./-](\d{1,2})', t)
+    if m:
+        return (_to_int(m.group(1)), _to_int(m.group(2)), _to_int(m.group(3)))
+
+    # 3) 월-일만 (공백 유무 허용)
+    m = re.search(r'(?<!\d)(\d{1,2})\s*월\s*(\d{1,2})\s*일(?!\d)', t)
+    if m:
+        return (None, _to_int(m.group(1)), _to_int(m.group(2)))
+
+    # 4) mm.dd / mm-dd / mm/dd (연도 없음)
+    m = re.search(r'(?<!\d)(\d{1,2})[./-](\d{1,2})(?!\d)', t)
+    if m:
+        return (None, _to_int(m.group(1)), _to_int(m.group(2)))
+
+    return (None, None, None)
