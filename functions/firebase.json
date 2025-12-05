@@ -1,0 +1,14 @@
+﻿{ 
+    "functions": { 
+        "source": "functions", 
+        "runtime": "python312", 
+        "python": "C:\\Users\\schong\\serverPy\\sajuApp_Server\\functions\\venv\\Scripts\\python.exe",
+        "functions": {
+            "predeploy": [
+            "powershell -NoProfile -ExecutionPolicy Bypass -File functions\\scripts\\clear_gcs.ps1"
+            ]
+        }
+    } 
+
+}
+

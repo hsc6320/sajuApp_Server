@@ -1,18 +1,6 @@
 {
-  "functions": [
-    {
-      "source": "functions",
-      "codebase": "default",
-      "ignore": [
-        "venv",
-        ".git",
-        "firebase-debug.log",
-        "firebase-debug.*.log",
-        "*.local"
-      ],
-      "runtime": "python313",
-      "python": "/Users/hongseungchang/Desktop/SajuApp_Server/functions/venv/bin/python3",
-      "region": "us-central1"
-    }
-  ]
+  "functions": {
+    "source": "functions",
+    "runtime": "python312"
+  }
 }

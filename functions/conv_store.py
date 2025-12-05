@@ -3,7 +3,7 @@
 
 from typing import Optional
 import os, re, json, unicodedata, hashlib
-import os, os.path as p
+import os.path as p
 from contextlib import contextmanager
 from contextvars import ContextVar
 from google.cloud import storage
@@ -67,6 +67,7 @@ def user_from_payload(payload: dict | None) -> dict | None:
 # 요청별로 안전한 컨텍스트 저장(동시 처리 대비)
 _CUR_USER_ID: ContextVar[str | None]  = ContextVar("_CUR_USER_ID",  default=None)
 _CUR_USER_META: ContextVar[dict | None] = ContextVar("_CUR_USER_META", default=None)
+_CUR_APP_UID: ContextVar[str | None] = ContextVar("_CUR_APP_UID", default=None)
 
 # --- 파일키 유틸들 ---------------------------------------------------------
 
@@ -98,6 +99,7 @@ def set_current_user_context(
     birth: str | None = None,
     reset: bool = False,
     user_id_override: Optional[str] = None,   # ← 필요 시 파일키를 직접 지정(최우선)
+    app_uid: Optional[str] = None,             # ← 앱 UID (Firebase Auth UID 등)
 ) -> None:
     """
     컨텍스트에 현재 요청의 '파일 키'를 저장한다.
@@ -110,12 +112,14 @@ def set_current_user_context(
     if reset:
         _CUR_USER_ID.set(None)
         _CUR_USER_META.set(None)
+        _CUR_APP_UID.set(None)
         return
 
     
-        # 입력 정규화
+    # 입력 정규화
     name  = (name  or "").strip() or None
     birth = (birth or "").strip() or None
+    app_uid = (app_uid or "").strip() or None
 
     # 1) 이름+생일 최우선
     if name and birth:
@@ -129,6 +133,7 @@ def set_current_user_context(
 
     _CUR_USER_ID.set(uid)
     _CUR_USER_META.set({"name": name, "birth": birth})
+    _CUR_APP_UID.set(app_uid)
 
 def get_current_user_id() -> str | None:
     """현재 요청 컨텍스트의 파일키 읽기(없으면 None)"""
@@ -137,6 +142,15 @@ def get_current_user_id() -> str | None:
     except LookupError:
         return None
     return (uid or "").strip() or None
+
+def get_current_app_uid() -> str | None:
+    """현재 요청 컨텍스트의 앱 UID 읽기(없으면 None)"""
+    try:
+        app_uid = _CUR_APP_UID.get()
+    except LookupError:
+        return None
+    return (app_uid or "").strip() or None
+
 
 
 @contextmanager
@@ -157,40 +171,63 @@ def user_context(*, user: dict | None = None, name: str | None = None, birth: st
 
 def _resolve_store_path_for_user(user_id: str) -> str:    
     """
-    Cloud: gs://<GCS_BUCKET>/<user_id>.json   (루트 저장)
+    Cloud: gs://<GCS_BUCKET>/users/<앱UID>/profiles/<user_id>.json
     - Cloud(Firebase/Cloud Run 등): GCS 사용
       * 필수: GCS_BUCKET
-    Local: <CONVO_BASE>/conversations/<user_id>.json
+      * 앱 UID가 있으면 users/<앱UID>/profiles/<user_id>.json 구조 사용
+      * 없으면 기존 방식(루트에 저장)으로 폴백
+    Local: <CONVO_BASE>/users/<앱UID>/profiles/<user_id>.json
     - user_id 정규화(NFKC), '/' '\' 제거(치환), .json 확장자 중복 방지
     """
     
     if not isinstance(user_id, str) or not user_id.strip():
         raise ValueError("user_id must be a non-empty string")
 
-    # 1) 키 안전화
+    # 1) 키 안전화 (user_id를 프로필 ID로 사용)
     key = unicodedata.normalize("NFKC", user_id.strip())
     key = key.replace("/", "_").replace("\\", "_")  # GCS 객체명 안전
     if not key.lower().endswith(".json"):
         key += ".json"
 
-    # 2) 클라우드/로컬 분기
+    # 2) 앱 UID 확인
+    try:
+        app_uid = _CUR_APP_UID.get()
+    except LookupError:
+        app_uid = None
+    
+    # 앱 UID 안전화
+    if app_uid:
+        app_uid = unicodedata.normalize("NFKC", app_uid.strip())
+        app_uid = app_uid.replace("/", "_").replace("\\", "_")
+
+    # 3) 클라우드/로컬 분기
     in_cloud = any(os.getenv(k) for k in ("K_SERVICE", "FUNCTION_TARGET", "FIREBASE_CONFIG"))
     if in_cloud:
         bucket = os.getenv("GCS_BUCKET")
         if not bucket:
             raise RuntimeError("GCS_BUCKET is required. e.g. GCS_BUCKET=chatsaju-5cd67-convos")
 
-        # ★ 루트에 저장 (prefix 없음)
-        path = f"gs://{bucket}/{key}"       
-        #print(f"[PATH] cloud per-user → {path}")           //[PATH] cloud per-user → gs://chatsaju-5cd67-convos/김지은__19880716.json
-        chatJsonFilePaht = path
+        # ★ 새로운 경로 구조: users/<앱UID>/profiles/<user_id>.json
+        if app_uid:
+            path = f"gs://{bucket}/users/{app_uid}/profiles/{key}"
+        else:
+            # 폴백: 기존 방식 (루트에 저장)
+            path = f"gs://{bucket}/{key}"
+        #print(f"[PATH] cloud per-user → {path}")
         return path
 
     # local
     base = os.getenv("CONVO_BASE", "./data")
-    conv_dir = os.path.join(os.path.abspath(base), "conversations")
-    os.makedirs(conv_dir, exist_ok=True)
-    path = os.path.join(conv_dir, key)
+    if app_uid:
+        # 새로운 경로 구조
+        user_dir = os.path.join(os.path.abspath(base), "users", app_uid, "profiles")
+        os.makedirs(user_dir, exist_ok=True)
+        path = os.path.join(user_dir, key)
+    else:
+        # 폴백: 기존 방식
+        conv_dir = os.path.join(os.path.abspath(base), "conversations")
+        os.makedirs(conv_dir, exist_ok=True)
+        path = os.path.join(conv_dir, key)
     print(f"[PATH] local per-user → {path}")
     
     return path
@@ -202,8 +239,13 @@ def _new_db_skeleton() -> dict:
     - 사용자 정보는 선택(있으면 저장)
     """
     db = {"version": 1, "sessions": {}}
-    if _CUR_USER_ID and _CUR_USER_META:
-        db["user"] = {"id": _CUR_USER_ID, **_CUR_USER_META}
+    try:
+        uid = _CUR_USER_ID.get()
+        um = _CUR_USER_META.get()
+        if uid and um:
+            db["user"] = {"id": uid, **um}
+    except LookupError:
+        pass
     return db
 # ================== [/NEW] ====================================================
 
@@ -463,7 +505,7 @@ def trim_session_history(session_id: str, max_turns: int = MAX_TURNS) -> bool:
         return False
 
     # 최근 max_turns 개만 남기기 (밀어내기)
-    new_turns = turns[-MAX_TURNS:]
+    new_turns = turns[-max_turns:]
     sess["turns"] = new_turns
 
     try:

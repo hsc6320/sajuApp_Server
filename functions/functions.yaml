@@ -1,0 +1,7 @@
+specVersion: v1alpha1
+endpoints:
+  ask_saju:
+    platform: gcfv2
+    region: us-central1
+    httpsTrigger: {}
+    entryPoint: ask_saju

@@ -1,5 +1,8 @@
 {
   "projects": {
-    "default": "chatsaju-5cd67"
-  }
+    "default": "chatsaju-5cd67",
+    "chatsaju-5cd67": "chatsaju-5cd67"
+  },
+  "targets": {},
+  "etags": {}
 }
