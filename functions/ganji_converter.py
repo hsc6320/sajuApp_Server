@@ -40,9 +40,17 @@ def convert_ganji_to_hanja(ganji):
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 JSON_PATH = os.path.join(CURRENT_DIR, "converted.json")
 
+# 전역 캐시
+_JSON_CACHE = {}
+
+def _get_cached_json(json_path: str):
+    if json_path not in _JSON_CACHE:
+        with open(json_path, "r", encoding="utf-8") as f:
+            _JSON_CACHE[json_path] = json.load(f)
+    return _JSON_CACHE[json_path]
+
 def get_year_ganji_from_json(date: datetime, json_path: str = JSON_PATH) -> str:
-    with open(json_path, "r", encoding="utf-8") as f:
-        json_data = json.load(f)
+    json_data = _get_cached_json(json_path)
 
      # ✅ 범위 가드 (JSON 커버리지 밖이면 명확히 예외)
     min_base = min(datetime.strptime(e["양력기준일"], "%Y-%m-%d") for e in json_data)
@@ -103,36 +111,75 @@ def get_year_group_index(year_stem: str) -> int:
         case _:
             return -1
 
-def get_wolju_from_date(solar_date: datetime, json_path: str = JSON_PATH) -> str | None:
-    with open(json_path, "r", encoding="utf-8") as f:
-        json_data = json.load(f)
+def get_wolju_from_date(
+    solar_date: datetime,
+    json_path: str = JSON_PATH,
+    month_only: bool = False,   # ✅ 월-only 질문용 플래그 추가
+) -> str | None:
+    """
+    solar_date: 기준 양력 날짜
+    month_only: True면 '25년 12월 직업운' 같이 '월 전체' 질문으로 보고,
+                해당 연/월에 시작하는 양력기준일 레코드를 우선 사용한다.
+                False면 기존처럼 '해당 일자 기준'으로 가장 가까운 과거 기준일을 사용.
+    """
+    json_data = _get_cached_json(json_path)
 
-    closest_solar_date = None
     selected_item = None
+    closest_solar_date = None
 
-    for item in json_data:
-        try:
-            current_solar = datetime.strptime(item["양력기준일"], "%Y-%m-%d")
-            if current_solar > solar_date:
+    # -----------------------------
+    # 1) 월-only 모드: 같은 연도+월의 양력기준일 레코드 우선 찾기
+    # -----------------------------
+    if month_only:
+        for item in json_data:
+            try:
+                current_solar = datetime.strptime(item["양력기준일"], "%Y-%m-%d")
+            except Exception:
                 continue
-            if closest_solar_date is None or current_solar > closest_solar_date:
-                closest_solar_date = current_solar
+
+            if (
+                current_solar.year == solar_date.year
+                and current_solar.month == solar_date.month
+            ):
                 selected_item = item
-        except Exception:
-            continue
+                closest_solar_date = current_solar
+                print(
+                    f"[WOLJU-MONTH] month-only match: target={solar_date.date()} "
+                    f"→ 기준일={current_solar.date()} 월주={item.get('월주')}"
+                )
+                break
+
+    # -----------------------------
+    # 2) fallback 또는 일반 모드: 기존 로직
+    #    (양력기준일 <= solar_date 중 가장 최근)
+    # -----------------------------
+    if selected_item is None:
+        for item in json_data:
+            try:
+                current_solar = datetime.strptime(item["양력기준일"], "%Y-%m-%d")
+                if current_solar > solar_date:
+                    continue
+                if closest_solar_date is None or current_solar > closest_solar_date:
+                    closest_solar_date = current_solar
+                    selected_item = item
+            except Exception:
+                continue
 
     if selected_item is None or closest_solar_date is None:
+        print("[WOLJU] no matching record in json_data")
         return None
 
     print(f"음력 변환 일 : {selected_item}")
+    print(f"[DEBUG] get_wolju_from_date input: {solar_date}, month_only={month_only}")
 
     # 1. 년간 추출
     year_stem = selected_item["년주"].strip()[0]
     group_index = get_year_group_index(year_stem)
     if group_index == -1:
+        print(f"[WOLJU] invalid year stem from {selected_item['년주']}")
         return None
 
-    # 2. 절기 기준으로 월 인덱스 계산
+    # 2. 절기 기준으로 월 인덱스 계산 (기존 그대로)
     month_index = -1
     for i, term in enumerate(solar_terms):
         term_year = solar_date.year
@@ -142,20 +189,26 @@ def get_wolju_from_date(solar_date: datetime, json_path: str = JSON_PATH) -> str
         if solar_date >= term_date:
             month_index = i
 
+    print(
+        f"[DEBUG] Solar Term Index: {month_index} "
+        f"(Date >= {month_index >= 0 and solar_terms[month_index]})"
+    )
+
     if month_index == -1:
         month_index = 11
-    
-    # 4) 테이블에서 '월주(천간+지지)'를 그대로 반환  ✅ 핵심
+
+    # 4) 테이블에서 '월주(천간+지지)'를 그대로 반환
     wolju = month_stem_table[group_index][month_index]
+    print(f"[DEBUG] Result Wolju: {wolju}")
     return wolju
+
 
 
 
 
 # 기준 JSON 데이터 불러오기
 def get_base_json_item(solar_date: datetime, json_path= JSON_PATH) -> dict:
-    with open(json_path, "r", encoding="utf-8") as f:
-        json_data = json.load(f)
+    json_data = _get_cached_json(json_path)
 
     closest_data = None
     closest_date = None
@@ -218,12 +271,10 @@ def resolve_two_digit_year(year_suffix: int,
     # 동률이면 과거/미래 선호 규칙
     return max(closest) if not prefer_past_on_tie else min(closest)
 
-# 모듈 로드 시 한 번만 계산
+# 모듈 로드 시 한 번만 계산 (캐시 활용)
 def _json_year_bounds(json_path: str) -> tuple[int, int]:
-    import json
-    from datetime import datetime
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    # 직접 import json 등 제거, 상단 import 활용
+    data = _get_cached_json(json_path)
 
     # 양력기준일이 오름차순/내림차순 어떤 상태든 안전하게 min/max 계산
     years = [datetime.strptime(e["양력기준일"], "%Y-%m-%d").year for e in data]

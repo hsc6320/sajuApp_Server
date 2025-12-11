@@ -317,20 +317,32 @@ def build_regression_and_deixis_context(
     #    print("[REG][HIST] first turn → regression=False (hard gate)")
         return question, dbg
 
-    # 2) 현재 발화 메타(키워드/kind/notes 등): JSON 검색 힌트로만 사용
-    try:
-        meta_now = _extract_meta(question)
-    except Exception as e:
-        print(f"[REG][META] exception in _extract_meta: {e}")
-        meta_now = {"msg_keywords": [], "kind": None, "notes": ""}
+    # ⭐ 2+3) 병렬 실행: 메타 추출 + 회귀 판정을 동시에 수행 (4-6초 → 2-3초)
+    from concurrent.futures import ThreadPoolExecutor
+    
+    meta_now = {"msg_keywords": [], "kind": None, "notes": ""}
+    reg = {"is_regression": False, "confidence": 0.0, "topic_keywords": [], "explicit_markers": [], "reasons": "exception"}
+    
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        # 두 LLM 호출을 동시에 시작
+        meta_future = executor.submit(_extract_meta, question)
+        reg_future = executor.submit(_llm_detect_regression, question, summary_text, hist)
+        
+        # 메타 추출 결과 대기
+        try:
+            meta_now = meta_future.result(timeout=10)
+        except Exception as e:
+            print(f"[REG][META] exception in _extract_meta: {e}")
+            meta_now = {"msg_keywords": [], "kind": None, "notes": ""}
+        
+        # 회귀 판정 결과 대기  
+        try:
+            reg = reg_future.result(timeout=10)
+        except Exception as e:
+            print(f"[REG][LLM] exception in _llm_detect_regression: {e}")
+            reg = {"is_regression": False, "confidence": 0.0, "topic_keywords": [], "explicit_markers": [], "reasons": "exception"}
+    
     print(f"[REG][META] now={meta_now}")
-
-    # 3) LLM 회귀 판정
-    try:
-        reg = _llm_detect_regression(question, summary_text, hist)
-    except Exception as e:
-        print(f"[REG][LLM] exception in _llm_detect_regression: {e}")
-        reg = {"is_regression": False, "confidence": 0.0, "topic_keywords": [], "explicit_markers": [], "reasons": "exception"}
     print(f"[REG][LLM] raw={reg}")
 
     conf_th = float(os.environ.get("REG_CONF_THRESH", "0.65"))

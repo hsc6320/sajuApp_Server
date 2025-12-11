@@ -22,7 +22,11 @@ def parse_korean_int(token: str) -> int | None:
         return int(token)
     return K_NUM.get(token)
 
-
+# 예: "25년 12월 직업운 어때?" 처럼 '월만' 있는 질문인가?
+def is_month_only_question(q: str) -> bool:
+    has_month = "월" in q
+    has_day = re.search(r"\d{1,2}\s*일", q)
+    return has_month and not has_day
 
 def handle_relative_day_keyword_with_ilju(
     question: str,
@@ -45,10 +49,11 @@ def handle_relative_day_keyword_with_ilju(
     abs_month = f"{tm}월"
     if abs_month not in absolute_expressions:
         absolute_expressions.append(abs_month)
-
+        
+    month_only = is_month_only_question(question)
     # 간지 계산
     year_ganji = get_year_ganji_from_json(datetime(ty, 5, 1), json_path)  # 년주(간지만 표기)
-    wolju      = get_wolju_from_date(datetime(ty, tm, 1), json_path)      # 월주(한자 2글자)
+    wolju      = get_wolju_from_date(target_date, json_path, month_only)      # [FIX] target_date 사용 (1일 고정 X)
     ilju       = get_ilju(target_date, json_path)                          # 일주(한자 2글자)
     print(f"일주 계산 : {year_ganji}.{wolju}.{ilju}")
 
@@ -111,7 +116,7 @@ def handle_korean_month_offset(
 
     # 연간 + 월주로 치환
     ganji_year = get_year_ganji_from_json(datetime(new_year, 5, 1), json_path)
-    wolju = get_wolju_from_date(datetime(new_year, new_month, 1), json_path)
+    wolju = get_wolju_from_date(datetime(new_year, new_month, 15), json_path) # [FIX] 1일->15일 (절기 반영)
     if wolju:
         relative_to_ganji_map[token] = f"{ganji_year}년 {wolju}월"
     else:
@@ -139,14 +144,14 @@ def handle_month_in_item(
     if not (1 <= month_num <= 12):
         return False
 
-    wolju = get_wolju_from_date(datetime(target_year, month_num, 1), json_path)
+    wolju = get_wolju_from_date(datetime(target_year, month_num, 15), json_path) # [FIX] 1일->15일 (절기 반영)
     if not wolju:
         return None
 
     original_token = m.group(0)              # '7월' 또는 '7 월'
     relative_to_ganji_map[original_token] = f"{wolju}월"  # 예: '癸未월'
     # relative_to_ganji_map[original_token] = replaced_value
-    print(f"월주 키워드 변환 {wolju}월")
+    print(f"월주 키워드 변환(Fixed15) {wolju}월")
 
     return f"{wolju}월"  # absolute_expressions에 넣을 값
 
@@ -347,7 +352,7 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
 
             # 연간/월주로 치환 (원하면 빼도 됨)
             ganji_year = get_year_ganji_from_json(datetime(new_year, 5, 1), JSON_PATH)
-            wolju = get_wolju_from_date(datetime(new_year, new_month, 1), JSON_PATH)  # 예: '丙戌'
+            wolju = get_wolju_from_date(datetime(new_year, new_month, 15), JSON_PATH)  # [FIX] 15일
             
             # 🔹 핵심: 토큰을 "연간 + 월주"로 한 번에 치환
             if wolju:
@@ -410,42 +415,7 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
 import re
 from typing import Optional, Tuple, List
 
-# 천간/지지
-STEMS_KO = ["갑","을","병","정","무","기","경","신","임","계"]
-STEMS_HZ = list("甲乙丙丁戊己庚辛壬癸")
-BRANCH_KO= ["자","축","인","묘","진","사","오","미","신","유","술","해"]
-BRANCH_HZ= list("子丑寅卯辰巳午未申酉戌亥")
 
-def to_hanzi_gan(gan_ko: str) -> str:
-    if gan_ko in STEMS_KO:
-        return STEMS_HZ[STEMS_KO.index(gan_ko)]
-    return gan_ko
-
-def to_hanzi_ji(ji_ko: str) -> str:
-    if ji_ko in BRANCH_KO:
-        return BRANCH_HZ[BRANCH_KO.index(ji_ko)]
-    return ji_ko
-
-
-# 접미사 "필수"로 강제 (이전 버전과의 차이!)
-YEAR_RX  = re.compile(r"(?:[갑을병정무기경신임계甲乙丙丁戊己庚辛壬癸]\s*[자축인묘진사오미신유술해子丑寅卯辰巳午未申酉戌亥])\s*(?:년|年)")
-MONTH_RX = re.compile(r"(?:[갑을병정무기경신임계甲乙丙丁戊己庚辛壬癸]\s*[자축인묘진사오미신유술해子丑寅卯辰巳午未申酉戌亥])\s*(?:월|月)")
-DAY_RX   = re.compile(r"(?:[갑을병정무기경신임계甲乙丙丁戊己庚辛壬癸]\s*[자축인묘진사오미신유술해子丑寅卯辰巳午未申酉戌亥])\s*(?:일|日)")
-HOUR_RX  = re.compile(r"(?:[갑을병정무기경신임계甲乙丙丁戊己庚辛壬癸]\s*[자축인묘진사오미신유술해子丑寅卯辰巳午未申酉戌亥])\s*(?:시|時)")
-
-def sexagenary_of_gregorian_year(year: int, prefer_hanzi: bool = True) -> str:
-    """
-    서기 연도 → 간지. 1984=甲子 기준.
-    index = (year - 4) % 10/12
-    """
-    print("sexagenary_of_gregorian_year")
-    stem = (year - 4) % 10
-    branch = (year - 4) % 12
-    gan_ko = STEMS_KO[stem]
-    ji_ko  = BRANCH_KO[branch]
-    if prefer_hanzi:
-        return STEMS_HZ[stem] + BRANCH_HZ[branch]
-    return gan_ko + ji_ko
 
 # def extract_target_ganji_v2(absolute_keywords: List[str], updated_question: str
 #                              ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
@@ -517,6 +487,11 @@ def parse_korean_date_safe(text: str) -> Tuple[Optional[int], Optional[int], Opt
     m = re.search(r'(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일', t)
     if m:
         return (_to_int(m.group(1)), _to_int(m.group(2)), _to_int(m.group(3)))
+
+    # 1-2) 년-월만 있는 경우 (일=1로 간주) -> [NEW] 15일로 변경(절기 고려)
+    m = re.search(r'(\d{4})\s*년\s*(\d{1,2})\s*월', t)
+    if m:
+        return (_to_int(m.group(1)), _to_int(m.group(2)), 15)
 
     # 2) yyyy.mm.dd / yyyy-mm-dd / yyyy/mm/dd
     m = re.search(r'(\d{4})[./-](\d{1,2})[./-](\d{1,2})', t)
