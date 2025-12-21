@@ -486,14 +486,48 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
     _ctx = False
     try:
         print("📥 요청 수신")
-        data = req.get_json()       
+        # ✅ JSON 파싱을 안전하게 처리 (빈 요청 또는 잘못된 형식 대응)
+        try:
+            data = req.get_json(silent=True) or {}
+        except Exception as e:
+            print(f"[WARN] JSON 파싱 실패: {e}")
+            # 요청 본문을 직접 읽어서 확인
+            try:
+                raw_data = req.get_data(as_text=True)
+                print(f"[DEBUG] 요청 본문 (raw): {raw_data[:200] if raw_data else '(empty)'}")
+                if raw_data:
+                    import json
+                    data = json.loads(raw_data)
+                else:
+                    data = {}
+            except Exception as e2:
+                print(f"[ERROR] 요청 본문 파싱 실패: {e2}")
+                return https_fn.Response(
+                    response=json.dumps({
+                        "error": "잘못된 요청 형식입니다. JSON 형식으로 요청해주세요.",
+                        "detail": str(e2)
+                    }, ensure_ascii=False),
+                    status=400,
+                    headers={"Content-Type": "application/json; charset=utf-8"}
+                )
+        
+        if not isinstance(data, dict):
+            return https_fn.Response(
+                response=json.dumps({
+                    "error": "요청 데이터가 올바른 형식이 아닙니다. JSON 객체를 전송해주세요."
+                }, ensure_ascii=False),
+                status=400,
+                headers={"Content-Type": "application/json; charset=utf-8"}
+            )
+        
         # --- 안전한 입력 파싱 ---
         question = (data.get("question") or "").strip()
         user_name = data.get("name") or ""
         sajuganji = data.get("sajuganji") or {}   # ✅ dict 기본값
-        daewoon = data.get("daewoon") or ""
-        current_daewoon = data.get("currentDaewoon") or ""
         session_id = data.get("session_id") or "single_global_session"
+        
+        # ✅ [NEW] 모드 구분 (saju / fortune)
+        mode = (data.get("mode") or "saju").strip().lower()
 
         # 사주 원국 기둥 (키 없을 수 있음)
         year  = sajuganji.get("년주", "") or ""
@@ -501,19 +535,51 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         day         = sajuganji.get("일주", "") or ""
         pillar_hour = sajuganji.get("시주", "") or ""      # ❗ time 변수명 피함
 
-        # 십성 참고
-        yinYang = data.get("yinYang", "") or ""
-        fiveElement = data.get("fiveElement", "") or ""
-        yearGan = data.get("yearGan") or ""
-        yearJi  = data.get("yearJi") or ""
-        wolGan  = data.get("wolGan") or ""
-        wolJi   = data.get("wolJi") or ""
-        ilGan   = data.get("ilGan") or ""
-        ilJi    = data.get("ilJi") or ""
-        siGan   = data.get("siGan") or ""
-        siJi    = data.get("siJi") or ""
-        currDaewoonGan = data.get("currDaewoonGan", "") or ""
-        currDaewoonJi  = data.get("currDaewoonJi", "")  or ""
+        # ✅ [NEW] 대운 정보 (배열 형태 지원)
+        daewoon_raw = data.get("daewoon")
+        if isinstance(daewoon_raw, list):
+            daewoon = daewoon_raw  # 배열 그대로 사용
+            daewoon_str = ", ".join(daewoon_raw)  # 로그/표시용 문자열
+        else:
+            daewoon = daewoon_raw or ""  # 기존 문자열 형태
+            daewoon_str = daewoon_raw or ""
+        
+        current_daewoon = data.get("currentDaewoon") or ""
+        
+        # ✅ [NEW] 대운 시작 나이
+        first_luck_age = data.get("firstLuckAge")
+        if first_luck_age is not None:
+            try:
+                first_luck_age = int(first_luck_age)
+            except (ValueError, TypeError):
+                first_luck_age = None
+
+        # ✅ 십성 정보 (sipseong_info 객체 또는 개별 필드 지원)
+        sipseong_info = data.get("sipseong_info") or {}
+        
+        # sipseong_info 객체가 있으면 우선 사용, 없으면 기존 개별 필드 사용
+        yinYang = sipseong_info.get("yinYang") or data.get("yinYang", "") or ""
+        fiveElement = sipseong_info.get("fiveElement") or data.get("fiveElement", "") or ""
+        
+        # 년간/년지
+        yearGan = sipseong_info.get("yearGan") or sipseong_info.get("년주") or data.get("yearGan") or ""
+        yearJi  = sipseong_info.get("yearJi") or sipseong_info.get("년주") or data.get("yearJi") or ""
+        
+        # 월간/월지
+        wolGan  = sipseong_info.get("wolGan") or sipseong_info.get("월간") or data.get("wolGan") or ""
+        wolJi   = sipseong_info.get("wolJi") or sipseong_info.get("월지") or data.get("wolJi") or ""
+        
+        # 일간/일지
+        ilGan   = sipseong_info.get("ilGan") or sipseong_info.get("일주") or data.get("ilGan") or ""
+        ilJi    = sipseong_info.get("ilJi") or sipseong_info.get("일주") or data.get("ilJi") or ""
+        
+        # 시간/시지
+        siGan   = sipseong_info.get("siGan") or sipseong_info.get("시간") or data.get("siGan") or ""
+        siJi    = sipseong_info.get("siJi") or sipseong_info.get("시지") or data.get("siJi") or ""
+        
+        # 대운간/대운지
+        currDaewoonGan = sipseong_info.get("currDaewoonGan") or sipseong_info.get("대운간") or data.get("currDaewoonGan", "") or ""
+        currDaewoonJi  = sipseong_info.get("currDaewoonJi") or sipseong_info.get("대운지") or data.get("currDaewoonJi", "") or ""
         
         # [ADD] 생년월일(YYYY-MM-DD 또는 YYYYMMDD). 앱에서 'birth' 또는 'birthday' 어느 키든 허용
         user_birth = (data.get("birth") or data.get("birthday") or "").strip()
@@ -561,24 +627,41 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             )
         
         # (옵션) 클라이언트가 'history'만 요청하는 경우
+        # ✅ 사용자 컨텍스트가 설정된 후에 처리 (올바른 파일 로드)
         if str(data.get("fetch_history", "")).lower() in ("1","true","yes","y"):
             # 저장소에서 그대로 읽어 반환 (세션 생성/LLM 미실행)
-            db = _db_load()
-            sess_id = (data.get("session_id") or "single_global_session")
-            sess = (db.get("sessions") or {}).get(sess_id) or {"meta": {"session_id": sess_id}, "turns": []}
-            uid = get_current_user_id() or ""   # ← 안전하게 호출
-            return https_fn.Response(
-                response=json.dumps(
-                    {
-                        "user_id": uid,
-                        "session_id": sess_id,
-                        "meta": sess.get("meta") or {},
-                        "turns": sess.get("turns") or [],
-                    }, ensure_ascii=False
-                ),
-                status=200,
-                headers={"Content-Type": "application/json; charset=utf-8"}
-            )
+            try:
+                db = _db_load()
+                sess_id = (data.get("session_id") or "single_global_session")
+                sess = (db.get("sessions") or {}).get(sess_id) or {"meta": {"session_id": sess_id}, "turns": []}
+                uid = get_current_user_id() or ""   # ← 안전하게 호출
+                path = _resolve_store_path_for_user(uid) if uid else "unknown"
+                print(f"[FETCH_HISTORY] user_id={uid}, session_id={sess_id}, path={path}, turns={len(sess.get('turns', []))}")
+                return https_fn.Response(
+                    response=json.dumps(
+                        {
+                            "user_id": uid,
+                            "session_id": sess_id,
+                            "path": path,
+                            "meta": sess.get("meta") or {},
+                            "turns": sess.get("turns") or [],
+                        }, ensure_ascii=False
+                    ),
+                    status=200,
+                    headers={"Content-Type": "application/json; charset=utf-8"}
+                )
+            except Exception as e:
+                print(f"[FETCH_HISTORY][ERROR] {e}")
+                import traceback
+                traceback.print_exc()
+                return https_fn.Response(
+                    response=json.dumps({
+                        "error": f"히스토리 로드 실패: {str(e)}",
+                        "user_id": get_current_user_id() or "",
+                    }, ensure_ascii=False),
+                    status=500,
+                    headers={"Content-Type": "application/json; charset=utf-8"}
+                )
 
 
         # --- 세션 보장 (hydration은 중복 체크 후로 이동) ---
@@ -755,11 +838,87 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
 
         print(f"[CRT] abs={parsed_meta.get('absolute_keywords')} / updated='{updated_question}'")
         
-
-        print(f"🧑 이름: {user_name}, 🌿 간지: {sajuganji}, 📊 대운: {daewoon}, 현재: {current_daewoon}")
-        print(f"십성정보 : 년간 {yearGan}/{yearJi} 월간{wolGan}/{wolJi} 일간{ilGan}/{ilJi} 대운{currDaewoonGan}/{currDaewoonJi}")
-        print(f"년주: {year} 월주: {month}")
-        print(f"❓ 질문: {question} {updated_question}")
+        # ============================================================================
+        # 📋 Flutter에서 받은 사주 정보 전체 로그
+        # ============================================================================
+        print("=" * 80)
+        print("📥 [FLUTTER 요청 데이터 전체 로그]")
+        print("=" * 80)
+        print(f"🧑 이름: {user_name}")
+        print(f"📅 생년월일: {user_birth}")
+        print(f"🆔 앱 UID: {app_uid}")
+        print(f"🔑 세션 ID: {session_id}")
+        print(f"🎯 모드: {mode}")
+        print("-" * 80)
+        print(f"🌿 간지 정보 (sajuganji):")
+        print(f"   년주: {year}")
+        print(f"   월주: {month}")
+        print(f"   일주: {day}")
+        print(f"   시주: {pillar_hour}")
+        print(f"   전체 객체: {json.dumps(sajuganji, ensure_ascii=False)}")
+        print("-" * 80)
+        print(f"📊 대운 정보:")
+        print(f"   대운 배열: {daewoon}")
+        print(f"   대운 문자열: {daewoon_str}")
+        print(f"   현재 대운: {current_daewoon}")
+        print(f"   대운 시작 나이: {first_luck_age}")
+        # 나이대별 대운 계산 및 출력 (년도, 십성, 십이운성 포함)
+        if isinstance(daewoon, list) and first_luck_age is not None:
+            from core.services import calculate_daewoon_by_age, _extract_birth_year
+            from Sipsin import _norm_stem
+            birth_year = _extract_birth_year(user_birth)
+            # 일간 정보 추출 (십성 계산용)
+            day_stem_hj = None
+            if ilGan:
+                try:
+                    day_stem_hj = _norm_stem(ilGan)
+                except Exception:
+                    pass
+            daewoon_by_age = calculate_daewoon_by_age(daewoon, first_luck_age, birth_year, day_stem_hj)
+            if daewoon_by_age:
+                print(f"   나이대별 대운:")
+                for item in daewoon_by_age:
+                    year_range = item.get('year_range', '')
+                    age_range = item.get('age_range', '')
+                    daewoon_ganji = item.get('daewoon', '')
+                    sipseong = item.get('sipseong', '')
+                    sipseong_branch = item.get('sipseong_branch', '')
+                    sibi_unseong = item.get('sibi_unseong', '')
+                    
+                    # 기본 정보
+                    if year_range:
+                        line = f"     {year_range}년: {age_range}세: {daewoon_ganji}"
+                    else:
+                        line = f"     {age_range}세: {daewoon_ganji}"
+                    
+                    # 십성과 십이운성 정보 추가
+                    sipseong_parts = []
+                    if sipseong:
+                        sipseong_parts.append(f"천간 십성={sipseong}")
+                    if sipseong_branch:
+                        sipseong_parts.append(f"지지 십성={sipseong_branch}")
+                    if sibi_unseong:
+                        sipseong_parts.append(f"십이운성={sibi_unseong}")
+                    
+                    if sipseong_parts:
+                        line += f" ({', '.join(sipseong_parts)})"
+                    
+                    print(line)
+        print("-" * 80)
+        print(f"☯️ 십성 정보:")
+        print(f"   음양: {yinYang}")
+        print(f"   오행: {fiveElement}")
+        print(f"   년간/년지: {yearGan}/{yearJi}")
+        print(f"   월간/월지: {wolGan}/{wolJi}")
+        print(f"   일간/일지: {ilGan}/{ilJi}")
+        print(f"   시간/시지: {siGan}/{siJi}")
+        print(f"   대운간/대운지: {currDaewoonGan}/{currDaewoonJi}")
+        print(f"   전체 sipseong_info 객체: {json.dumps(sipseong_info, ensure_ascii=False)}")
+        print("-" * 80)
+        print(f"❓ 질문:")
+        print(f"   원본: {question}")
+        print(f"   변환 후: {updated_question}")
+        print("=" * 80)
         
         {
             # print("===========================테스트 코드 ===============================")
@@ -829,8 +988,11 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         #category = classify_question(updated_question)
         #print(f"📂 최종 분류 결과: {category}")
         # ──────────────────────────────── fortune(점괘) 분기 ────────────────────────────────
-        #if category == "fortune":
-        if is_fortune_query(updated_question):
+        # ✅ mode가 명시적으로 'fortune'이면 우선 사용, 아니면 키워드 기반 판단
+        is_fortune = (mode == "fortune") or is_fortune_query(updated_question)
+        print(f"🔮 모드 판단: mode={mode}, is_fortune={is_fortune}")
+        
+        if is_fortune:
             try:
                 # ✅ 최적화: ChatMessageHistory에는 moving_summary_buffer 없음
                 # 최근 대화 요약은 get_session_brief_summary()로 대체
@@ -967,6 +1129,10 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
 
 
             user_payload = make_saju_payload(data, focus, updated_question)
+            # ✅ app_uid를 payload에 추가 (record_turn_message에서 사용)
+            if app_uid:
+                user_payload["app_uid"] = app_uid
+            print(json.dumps(user_payload.get("meta", {}).get("daewoon_by_age"), ensure_ascii=False))
             # → prompt 호출 시 {comparison_block}에 주입
 
             #비교 블록 만들기
@@ -1066,12 +1232,58 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             # 회귀 빌더에서 만든 질문(맥락 포함) 사용; 없으면 updated_question
             effective_question = (question_for_llm or parsed_meta.get("updated_question") or updated_question or question)
             bridge_text = _make_bridge(reg_dbg.get("facts", {}))
-            facts_json   = json.dumps(reg_dbg.get("facts", {}), ensure_ascii=False)            
-          
+            facts_json   = json.dumps(reg_dbg.get("facts", {}), ensure_ascii=False)
+            
+            # ✅ [NEW] 나이대별 대운 정보 포맷팅 (년도, 십성, 십이운성 포함)
+            daewoon_by_age = user_payload.get("meta", {}).get("daewoon_by_age", [])
+            daewoon_age_text = ""
+            if daewoon_by_age:
+                daewoon_lines = []
+                for item in daewoon_by_age:
+                    year_range = item.get("year_range", "")
+                    age_range = item.get("age_range", "")
+                    daewoon_ganji = item.get("daewoon", "")
+                    sipseong = item.get("sipseong", "")
+                    sipseong_branch = item.get("sipseong_branch", "")
+                    sibi_unseong = item.get("sibi_unseong", "")
+                    
+                    # 기본 정보
+                    if year_range:
+                        line = f"  - {year_range}년: {age_range}세: {daewoon_ganji}"
+                    else:
+                        line = f"  - {age_range}세: {daewoon_ganji}"
+                    
+                    # 십성과 십이운성 정보 추가
+                    sipseong_parts = []
+                    if sipseong:
+                        sipseong_parts.append(f"천간 십성={sipseong}")
+                    if sipseong_branch:
+                        sipseong_parts.append(f"지지 십성={sipseong_branch}")
+                    if sibi_unseong:
+                        sipseong_parts.append(f"십이운성={sibi_unseong}")
+                    
+                    if sipseong_parts:
+                        line += f" ({', '.join(sipseong_parts)})"
+                    
+                    daewoon_lines.append(line)
+                daewoon_age_text = "\n".join(daewoon_lines)
+            
+            # 나이대별 대운 정보를 context에 추가
+            daewoon_context = ""
+            if daewoon_age_text:
+                daewoon_context = f"\n\n[나이대별 대운 정보]\n{daewoon_age_text}\n"
+            
+            # comparison_block을 context에 추가 (있으면)
+            comparison_context = ""
+            if comparison_block:
+                comparison_context = f"\n\n[비교 입력]\n{comparison_block}\n"
+            
+            # context에 나이대별 대운 정보와 comparison_block 추가
+            enhanced_context = reg_prompt + daewoon_context + comparison_context
             
             result = chat_with_memory.invoke(
                 {
-                    "context": reg_prompt,                              # 회귀/컨텍스트 전문
+                    "context": enhanced_context,                        # 회귀/컨텍스트 전문 + 나이대별 대운
                     "facts": facts_json,                                # 구조화 FACT
                     "summary": summary_text,                            # moving_summary_buffer
                     "question": effective_question,         # 히스토리 키

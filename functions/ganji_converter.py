@@ -179,23 +179,29 @@ def get_wolju_from_date(
         print(f"[WOLJU] invalid year stem from {selected_item['년주']}")
         return None
 
-    # 2. 절기 기준으로 월 인덱스 계산 (기존 그대로)
-    month_index = -1
-    for i, term in enumerate(solar_terms):
-        term_year = solar_date.year
-        if i == 11:  # 소한 이전일 경우는 전년도 12월 처리
-            term_year += 1
-        term_date = datetime(term_year, term["month"], term["day"])
-        if solar_date >= term_date:
-            month_index = i
+    # 2. 절기 기준으로 월 인덱스 계산
+    # 소한(1월 5일) 이전의 날짜는 전년도 12월(month_index=11)로 처리
+    sohan_date = datetime(solar_date.year, 1, 5)
+    if solar_date < sohan_date:
+        month_index = 11  # 전년도 12월
+    else:
+        # 소한 이후부터 각 절기를 순회하며 해당하는 월 인덱스 찾기
+        month_index = -1
+        for i, term in enumerate(solar_terms):
+            term_year = solar_date.year
+            term_date = datetime(term_year, term["month"], term["day"])
+            # 해당 절기 이후인 경우 해당 월 인덱스로 설정
+            if solar_date >= term_date:
+                month_index = i
+        
+        # 만약 어떤 절기도 만족하지 않으면 (이론적으로 발생하지 않아야 함)
+        if month_index == -1:
+            month_index = 11  # 안전장치: 전년도 12월로 처리
 
     print(
         f"[DEBUG] Solar Term Index: {month_index} "
-        f"(Date >= {month_index >= 0 and solar_terms[month_index]})"
+        f"(Date: {solar_date.date()}, Term: {solar_terms[month_index] if month_index >= 0 else 'None'})"
     )
-
-    if month_index == -1:
-        month_index = 11
 
     # 4) 테이블에서 '월주(천간+지지)'를 그대로 반환
     wolju = month_stem_table[group_index][month_index]

@@ -16,7 +16,7 @@ import os, re, json
 from datetime import date, datetime, timedelta
 from langchain_openai import ChatOpenAI
 
-from conv_store import _CUR_USER_ID, _db_load, _db_save, _is_gs_path, _max_turns, _parse_gs_path, _resolve_store_path_for_user, _trim_session_turns, get_current_user_id, make_user_key, set_current_user_context, user_from_payload
+from conv_store import _CUR_USER_ID, _db_load, _db_save, _is_gs_path, _max_turns, _parse_gs_path, _resolve_store_path_for_user, _trim_session_turns, get_current_user_id, get_current_app_uid, make_user_key, set_current_user_context, user_from_payload
 try:
     from zoneinfo import ZoneInfo  # Py3.9+
 except Exception:
@@ -632,12 +632,58 @@ def record_turn_message(
     
     # ── [A] 사용자 컨텍스트 임시 적용 (있으면 설정, 없으면 기존 유지) ─────────────
     _needs_reset = False
+    # 기존 컨텍스트 확인 (main.py에서 이미 설정했을 수 있음)
+    existing_user_id = get_current_user_id()
+    existing_app_uid = get_current_app_uid()
+    
     if user:
-        set_current_user_context(user=user); _needs_reset = True
+        new_user_id = user.get("id") or make_user_key(user.get("name"), user.get("birth"))
+        # 기존 컨텍스트가 있고 user_id가 같으면 재설정하지 않음 (app_uid 유지)
+        if existing_user_id and existing_user_id == new_user_id:
+            # 컨텍스트가 이미 올바르게 설정되어 있음, app_uid만 확인/업데이트
+            if not existing_app_uid and user.get("app_uid"):
+                set_current_user_context(
+                    name=user.get("name"),
+                    birth=user.get("birth"),
+                    user_id_override=user.get("id"),
+                    app_uid=user.get("app_uid")
+                )
+                _needs_reset = True
+        else:
+            # ✅ user dict를 개별 인자로 전달
+            set_current_user_context(
+                name=user.get("name"),
+                birth=user.get("birth"),
+                user_id_override=user.get("id"),
+                app_uid=existing_app_uid or user.get("app_uid")  # 기존 app_uid 유지 또는 user에서 가져오기
+            )
+            _needs_reset = True
     elif payload:
         up = user_from_payload(payload)
         if up:
-            set_current_user_context(user=up); _needs_reset = True
+            new_user_id = up.get("id")
+            # ✅ payload에서 app_uid 추출 시도 (payload에 직접 있을 수 있음)
+            payload_app_uid = payload.get("app_uid") or payload.get("appUid") or payload.get("uid") if payload else None
+            # 기존 컨텍스트가 있고 user_id가 같으면 재설정하지 않음 (app_uid만 업데이트)
+            if existing_user_id and existing_user_id == new_user_id:
+                # 컨텍스트가 이미 올바르게 설정되어 있음, app_uid만 확인/업데이트
+                if not existing_app_uid and payload_app_uid:
+                    set_current_user_context(
+                        name=up.get("name"),
+                        birth=up.get("birth"),
+                        user_id_override=up.get("id"),
+                        app_uid=payload_app_uid
+                    )
+                    _needs_reset = True
+            else:
+                # ✅ user dict를 개별 인자로 전달, app_uid도 함께 전달
+                set_current_user_context(
+                    name=up.get("name"),
+                    birth=up.get("birth"),
+                    user_id_override=up.get("id"),
+                    app_uid=existing_app_uid or payload_app_uid  # 기존 app_uid 우선, 없으면 payload에서 가져오기
+                )
+                _needs_reset = True
     try:
         db = _db_load()
         if session_id not in db["sessions"]:

@@ -11,6 +11,43 @@ from regress_conversation import get_extract_chain, _today, _maybe_override_targ
 from converting_time import extract_target_ganji_v2, convert_relative_time, parse_korean_date_safe, is_month_only_question
 from sip_e_un_sung import _branch_of, unseong_for, branch_for, pillars_unseong, seun_unseong
 from Sipsin import _norm_stem, branch_from_any, get_sipshin, get_ji_sipshin_only, stem_from_any
+from datetime import datetime
+
+def _extract_birth_year(birth_str: str) -> Optional[int]:
+    """
+    생년월일 문자열에서 출생 연도를 추출합니다.
+    
+    Args:
+        birth_str: 생년월일 문자열 (예: "1988-07-16", "19880716", "1988/07/16")
+    
+    Returns:
+        출생 연도 (int) 또는 None
+    """
+    if not birth_str or not isinstance(birth_str, str):
+        return None
+    
+    birth_str = birth_str.strip()
+    if not birth_str:
+        return None
+    
+    try:
+        # YYYY-MM-DD 형식
+        if "-" in birth_str:
+            parts = birth_str.split("-")
+            if len(parts) >= 1:
+                return int(parts[0])
+        # YYYYMMDD 형식
+        elif len(birth_str) >= 4:
+            return int(birth_str[:4])
+        # YYYY/MM/DD 형식
+        elif "/" in birth_str:
+            parts = birth_str.split("/")
+            if len(parts) >= 1:
+                return int(parts[0])
+    except (ValueError, TypeError):
+        pass
+    
+    return None
 
 # 1. 키워드 기반 카테고리 분류 함수
 
@@ -56,8 +93,10 @@ def _sipseong_split_for_target(day_stem_hj: str, target_ganji: str | None) -> st
     - 천간 십성(= sipseong)
     - 지지 십성(= sipseong_branch)
     를 함께 반환한다."""
-    if not target_ganji:
+    # ✅ 일간이 없거나 타겟이 없으면 None 반환
+    if not day_stem_hj or not target_ganji:
         return None, None
+    
     t_stem_hj = stem_from_any(target_ganji)
     t_branch_hj = branch_from_any(target_ganji)
     
@@ -121,6 +160,91 @@ def mirror_target_times_to_legacy(payload: dict) -> None:
         payload["resolved"]["flow_now"]["target"][s] = (dict(slot) if slot else None)
 
 
+def calculate_daewoon_by_age(daewoon_list: List[str], first_luck_age: Optional[int], birth_year: Optional[int] = None, day_stem_hj: Optional[str] = None) -> List[dict]:
+    """
+    대운 배열과 대운 시작 나이를 받아서 나이대별 대운을 계산합니다.
+    생년월일이 있으면 년도 정보도 함께 계산하고, 일간이 있으면 십성과 십이운성도 계산합니다.
+    
+    Args:
+        daewoon_list: 대운 배열 (예: ["壬戌", "辛酉", "庚申", ...])
+        first_luck_age: 대운 시작 나이 (예: 4)
+        birth_year: 출생 연도 (예: 1988, 선택사항)
+        day_stem_hj: 일간 한자 (예: "壬", 십성 계산용, 선택사항)
+    
+    Returns:
+        나이대별 대운 정보 리스트
+        예: [
+            {
+                "year_range": "1992-2001", 
+                "age_range": "4-13", 
+                "daewoon": "壬戌",
+                "stem": "壬",
+                "branch": "戌",
+                "sipseong": "비견",
+                "sipseong_branch": "편인",
+                "sibi_unseong": "건록",
+                "start_year": 1992, 
+                "end_year": 2001, 
+                "start_age": 4, 
+                "end_age": 13
+            },
+            ...
+        ]
+    """
+    if not daewoon_list or not isinstance(daewoon_list, list) or len(daewoon_list) == 0:
+        return []
+    
+    if first_luck_age is None or first_luck_age < 0:
+        return []
+    
+    result = []
+    daewoon_duration = 10  # 각 대운은 10년씩 지속
+    
+    for idx, daewoon in enumerate(daewoon_list):
+        start_age = first_luck_age + (idx * daewoon_duration)
+        end_age = start_age + daewoon_duration - 1
+        
+        # 간지에서 천간과 지지 추출
+        stem = stem_from_any(daewoon) if daewoon else None
+        branch = branch_from_any(daewoon) if daewoon else None
+        
+        item = {
+            "age_range": f"{start_age}-{end_age}",
+            "start_age": start_age,
+            "end_age": end_age,
+            "daewoon": daewoon,
+            "stem": stem,
+            "branch": branch
+        }
+        
+        # 생년월일이 있으면 년도 정보도 계산
+        if birth_year is not None:
+            start_year = birth_year + start_age
+            end_year = birth_year + end_age
+            item["year_range"] = f"{start_year}-{end_year}"
+            item["start_year"] = start_year
+            item["end_year"] = end_year
+        
+        # 일간이 있으면 십성과 십이운성 계산
+        if day_stem_hj and daewoon:
+            try:
+                # 천간/지지 십성 계산
+                sipseong, sipseong_branch = _sipseong_split_for_target(day_stem_hj, daewoon)
+                item["sipseong"] = sipseong
+                item["sipseong_branch"] = sipseong_branch
+                
+                # 십이운성 계산 (지지 기반)
+                if branch:
+                    sibi_unseong = unseong_for(day_stem_hj, branch)
+                    item["sibi_unseong"] = sibi_unseong
+            except Exception as e:
+                print(f"[calculate_daewoon_by_age] ⚠️ 십성/십이운성 계산 실패: {e}")
+                # 계산 실패해도 기본 정보는 유지
+        
+        result.append(item)
+    
+    return result
+
 def _entry_from_known(day_stem_hj, scope: str, g: Optional[str], sip_gan, sip_br, sibi) -> Optional[dict]:
     if not g:
         return None
@@ -145,9 +269,29 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     question   = data.get("question", "") or ""
     user_name  = data.get("name", "") or ""
     sajuganji  = data.get("sajuganji") or {}          # ❗ 기본값은 dict
-    daewoon    = data.get("daewoon", "") or ""
-    current_dw = data.get("currentDaewoon", "") or "" # 문자열/간지표현일 수 있음
     session_id = data.get("session_id") or "single_global_session"  # 필요 시 요청에서 받기
+    
+    # ✅ [NEW] 모드 구분 (saju / fortune)
+    mode = (data.get("mode") or "saju").strip().lower()
+
+    # ✅ [NEW] 대운 정보 (배열 형태 지원)
+    daewoon_raw = data.get("daewoon")
+    if isinstance(daewoon_raw, list):
+        daewoon = daewoon_raw  # 배열 그대로 사용
+        daewoon_str = ", ".join(daewoon_raw)  # 로그/표시용 문자열
+    else:
+        daewoon = daewoon_raw or ""  # 기존 문자열 형태
+        daewoon_str = daewoon_raw or ""
+    
+    current_dw = data.get("currentDaewoon", "") or "" # 문자열/간지표현일 수 있음
+    
+    # ✅ [NEW] 대운 시작 나이
+    first_luck_age = data.get("firstLuckAge")
+    if first_luck_age is not None:
+        try:
+            first_luck_age = int(first_luck_age)
+        except (ValueError, TypeError):
+            first_luck_age = None
 
     # 사주 원국 기둥 (키가 없을 수 있으니 dict.get 사용)
     year        = sajuganji.get("년주", "") or ""
@@ -155,20 +299,44 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     day         = sajuganji.get("일주", "") or ""
     pillar_hour = sajuganji.get("시주", "") or ""      # ❗ time 변수명 피함
 
-    # 십성 참고 정보 (없을 수 있음)
-    yinYang        = data.get("yinYang", "") or ""
-    fiveElement    = data.get("fiveElement", "") or ""
-    yearGan        = data.get("yearGan", "") or ""
-    yearJi         = data.get("yearJi", "") or ""
-    wolGan         = data.get("wolGan", "") or ""
-    wolJi          = data.get("wolJi", "") or ""
-    ilGan          = data.get("ilGan", "") or ""
-    ilJi           = data.get("ilJi", "") or ""
-    siGan          = data.get("siGan", "") or ""
-    siJi           = data.get("siJi", "") or ""
-    currDwGan      = data.get("currDaewoonGan", "") or ""
-    currDwJi       = data.get("currDaewoonJi", "") or ""
-
+    # ✅ 십성 정보 (sipseong_info 객체 또는 개별 필드 지원)
+    sipseong_info = data.get("sipseong_info") or {}
+    
+    # sipseong_info 객체가 있으면 우선 사용, 없으면 기존 개별 필드 사용
+    yinYang = sipseong_info.get("yinYang") or data.get("yinYang", "") or ""
+    fiveElement = sipseong_info.get("fiveElement") or data.get("fiveElement", "") or ""
+    
+    # 년간/년지
+    yearGan = sipseong_info.get("yearGan") or sipseong_info.get("년간") or data.get("yearGan") or ""
+    yearJi  = sipseong_info.get("yearJi") or sipseong_info.get("년지") or data.get("yearJi") or ""
+    
+    # 월간/월지
+    wolGan  = sipseong_info.get("wolGan") or sipseong_info.get("월간") or data.get("wolGan") or ""
+    wolJi   = sipseong_info.get("wolJi") or sipseong_info.get("월지") or data.get("wolJi") or ""
+    
+    # 일간/일지
+    ilGan   = sipseong_info.get("ilGan") or sipseong_info.get("일간") or data.get("ilGan") or ""
+    ilJi    = sipseong_info.get("ilJi") or sipseong_info.get("일지") or data.get("ilJi") or ""
+    
+    # ✅ 일간이 없거나 "일간"이라는 라벨이면 일주에서 추출 (fallback)
+    # Flutter에서 올바른 일간을 전송하므로, 이 로직은 fallback으로만 사용
+    if (not ilGan or ilGan == "일간") and day:
+        try:
+            extracted_ilGan = stem_from_any(day)  # 일주에서 천간 추출
+            if extracted_ilGan:
+                ilGan = extracted_ilGan
+                print(f"[make_saju_payload] ⚠️ 일간이 비어있어 일주({day})에서 추출: {ilGan}")
+        except Exception as e:
+            print(f"[make_saju_payload] ⚠️ 일주에서 일간 추출 실패: {e}")
+    
+    # 시간/시지
+    siGan   = sipseong_info.get("siGan") or sipseong_info.get("시간") or data.get("siGan") or ""
+    siJi    = sipseong_info.get("siJi") or sipseong_info.get("시지") or data.get("siJi") or ""
+    
+    # 대운간/대운지
+    currDwGan = sipseong_info.get("currDaewoonGan") or sipseong_info.get("대운간") or data.get("currDaewoonGan", "") or ""
+    currDwJi  = sipseong_info.get("currDaewoonJi") or sipseong_info.get("대운지") or data.get("currDaewoonJi", "") or ""
+    print(f"make_saju_payload] 간지정보 확인 : siGan={siGan} currDwGan={currDwGan} wolGan = {wolGan}")
     # 질문에서 타겟 간지 추출 (에러 가드)
     try:
         t_year_ganji, t_month_ganji, t_day_ganji, t_hour_ganji = extract_target_ganji_v2(updated_question)
@@ -196,18 +364,23 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     }
 
     #  일간(천간) 표준화: 한글/혼합 → 한자(예: '임'→'壬') (★)
-    day_stem_hj = _norm_stem(ilGan)  # ilGan 예: '임' 또는 '壬' 한자로 변환
+    # ✅ ilGan이 비어있으면 None 반환 (에러 방지)
+    try:
+        day_stem_hj = _norm_stem(ilGan) if ilGan else None
+    except ValueError as e:
+        print(f"[make_saju_payload] ⚠️ 일간 정규화 실패: {e}, ilGan={ilGan}")
+        day_stem_hj = None
 
     
     # None이 섞여 있어도 pillars_unseong 내부에서 처리됨
-     # 타겟(연/월/일/시) 십이운성 맵
-    target_sibi_map = pillars_unseong(day_stem_hj, pillars_branches)
+    # 타겟(연/월/일/시) 십이운성 맵
+    target_sibi_map = pillars_unseong(day_stem_hj, pillars_branches) if day_stem_hj else {k: None for k in pillars_branches}
     # 예: {'year': '관대', 'month': '절', 'day': None, 'hour': '장생'}
 
     # === [B] 현재 대운 십이운성 (★ _branch_of → branch_from_any)
     print(f"current_dw : {current_dw}")
     current_dw_branch = branch_from_any(current_dw)  # 예: '亥' 또는 None
-    curr_dw_sibi = unseong_for(day_stem_hj, current_dw_branch) if current_dw_branch else None
+    curr_dw_sibi = unseong_for(day_stem_hj, current_dw_branch) if (day_stem_hj and current_dw_branch) else None
     
     print(f"day_stem_hj : {day_stem_hj}, current_dw_branch : {current_dw_branch}, curr_dw_sibi : {curr_dw_sibi}")
     
@@ -332,6 +505,120 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         seen.add(key); dedup.append(e)
     target_times = dedup
 
+    # === [NEW] daewoon_by_age 계산 (payload 생성 전에 미리 계산) ===
+    import re
+    birth_year = _extract_birth_year(data.get("birth") or data.get("birthday") or "")
+    daewoon_by_age = calculate_daewoon_by_age(
+        daewoon if isinstance(daewoon, list) else [],
+        first_luck_age,
+        birth_year,
+        day_stem_hj
+    )
+    
+    # === [NEW] 질문에서 년도를 추출하여 daewoon_by_age에서 대운 찾기 ===
+    # 중요: 특정 년도를 언급한 질문이면, 그 년도에 해당하는 대운을 반드시 사용해야 함
+    # 예: "2007년 사주" → 2007년에 해당하는 대운을 찾아서 사용 (나이와 무관하게 해당 년도의 대운 사용)
+    # 예: "2008년에 나 무슨 대운 이였지?" → 2008년에 해당하는 대운을 찾아서 사용
+    # 예: "88년", "21년" 같은 2자리 년도도 인식 (1988년, 2021년으로 해석)
+    # 50 이상: 1900년대 (예: 88 → 1988), 50 미만: 2000년대 (예: 21 → 2021)
+    # ⚠️ 주의: updated_question은 "2005년"이 "乙酉년"으로 변환될 수 있으므로, 원본 question에서 먼저 추출
+    
+    # === [NEW] 질문에서 년도를 추출하여 daewoon_by_age에서 대운 찾기 ===
+    # 원본 question에서 먼저 년도 추출 (변환 전 원문이므로 년도 숫자가 그대로 있음)
+    # 또한 msg_keywords에서도 년도 추출 시도 (LLM이 이미 추출한 경우)
+    # print(f"[make_saju_payload] 🔍 년도 추출 시도: question='{question}', updated_question='{updated_question}'")
+
+    # 1) 원본 question에서 4자리
+    year_numbers_4digit = re.findall(r'(?<!\d)(19\d{2}|20\d{2})(?!\d)', question)
+    print(f"[make_saju_payload] 🔍 4자리 년도 추출 (원본): {year_numbers_4digit}")
+    if not year_numbers_4digit:
+        year_numbers_4digit = re.findall(r'(?<!\d)(19\d{2}|20\d{2})(?!\d)', updated_question)
+        print(f"[make_saju_payload] 🔍 4자리 년도 추출 (변환): {year_numbers_4digit}")
+
+    # 2) 원본 question에서 2자리 (년/년도 붙은 것만)
+    year_numbers_2digit = re.findall(r'(?<!\d)(\d{2})\s*(?:년|년도)(?!\d)', question)
+    print(f"[make_saju_payload] 🔍 2자리 년도 추출 (원본): {year_numbers_2digit}")
+    if not year_numbers_2digit:
+        year_numbers_2digit = re.findall(r'(?<!\d)(\d{2})\s*(?:년|년도)(?!\d)', updated_question)
+        print(f"[make_saju_payload] 🔍 2자리 년도 추출 (변환): {year_numbers_2digit}")
+
+    # 2) msg_keywords에서도 년도 추출 시도 (LLM이 이미 추출한 경우)
+    msg_keywords = data.get("msg_keywords") or []
+    if msg_keywords:
+        for kw in msg_keywords:
+            # 4자리 년도 패턴
+            kw_years_4 = re.findall(r'(?<!\d)(19\d{2}|20\d{2})(?!\d)', str(kw))
+            if kw_years_4:
+                year_numbers_4digit.extend(kw_years_4)
+                print(f"[make_saju_payload] 🔍 msg_keywords에서 4자리 년도 추출: {kw_years_4}")
+            # 2자리 년도 패턴 (숫자만 있는 경우, 2000년대로 가정)
+            kw_years_2 = re.findall(r'^(\d{2})$', str(kw))
+            if kw_years_2:
+                # 2자리 년도를 4자리로 변환 (2000년대로 가정)
+                for yy_str in kw_years_2:
+                    try:
+                        yy = int(yy_str)
+                        full_year = 2000 + yy  # 2000년대로 가정
+                        year_numbers_4digit.append(str(full_year))
+                        print(f"[make_saju_payload] 🔍 msg_keywords에서 2자리 년도 변환: {yy_str} → {full_year}")
+                    except (ValueError, TypeError):
+                        continue
+    
+    # 2자리 년도를 4자리로 변환 (2000년대로 가정)
+    year_numbers_2digit_converted = []
+    for yy_str in year_numbers_2digit:
+        try:
+            yy = int(yy_str)
+            full_year = 2000 + yy  # 2000년대로 가정
+            year_numbers_2digit_converted.append(str(full_year))
+            print(f"[make_saju_payload] 🔍 2자리 년도 변환: {yy_str} → {full_year}")
+        except (ValueError, TypeError):
+            continue
+    
+    # 최종 년도 리스트 (중복 제거)
+    year_numbers = list(dict.fromkeys(year_numbers_4digit + year_numbers_2digit_converted))
+    print(f"[make_saju_payload] 🔍 최종 추출된 년도: {year_numbers}, daewoon_by_age 개수: {len(daewoon_by_age) if daewoon_by_age else 0}")
+    
+    matched_daewoon = None
+    if year_numbers and daewoon_by_age:
+        for year_str in year_numbers:
+            try:
+                target_year = int(year_str)
+                for item in daewoon_by_age:
+                    start_year = item.get("start_year")
+                    end_year = item.get("end_year")
+                    if start_year is not None and end_year is not None:
+                        if start_year <= target_year <= end_year:
+                            matched_daewoon = item
+                            print(f"[make_saju_payload] ✅ {target_year}년 대운 매칭: {item.get('daewoon')} ({item.get('year_range')})")
+                            break
+                if matched_daewoon:
+                    break
+            except (ValueError, TypeError):
+                continue
+    
+    # 대운이 매칭되었으면 current_dw와 십성 정보를 확실하게 업데이트
+    if matched_daewoon:
+        matched_dw_ganji = matched_daewoon.get("daewoon")
+        if matched_dw_ganji:
+            current_dw = matched_dw_ganji
+            # 대운 십성/십이운성을 무조건 재계산하여 확실하게 설정 (일간 기준)
+            if day_stem_hj:
+                dw_sip_gan_new, dw_sip_br_new = _sipseong_split_for_target(day_stem_hj, matched_dw_ganji)
+                # 재계산된 값으로 확실하게 업데이트
+                dw_sip_gan = dw_sip_gan_new
+                dw_sip_br = dw_sip_br_new
+                # 십이운성 재계산
+                matched_dw_branch = matched_daewoon.get("branch")
+                if matched_dw_branch:
+                    curr_dw_sibi = unseong_for(day_stem_hj, matched_dw_branch) if day_stem_hj else None
+                else:
+                    # branch가 없으면 간지에서 추출
+                    matched_dw_branch = branch_from_any(matched_dw_ganji)
+                    if matched_dw_branch:
+                        curr_dw_sibi = unseong_for(day_stem_hj, matched_dw_branch) if day_stem_hj else None
+        print(f"[make_saju_payload] ✅ 대운 정보 업데이트: {current_dw} (십성: {dw_sip_gan}/{dw_sip_br}, 십이운성: {curr_dw_sibi})")
+
     # 최종 스키마 구성
     payload = {
         "saju": {
@@ -394,13 +681,31 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         },
 
         "focus": focus,
+        "mode": mode,  # ✅ [NEW] saju / fortune 모드 구분
         "meta": {
             "user_name": user_name,
-            "daewoon": daewoon,
+            "daewoon": daewoon,  # 배열 또는 문자열
+            "daewoon_list": daewoon if isinstance(daewoon, list) else None,  # ✅ [NEW] 대운 배열 (배열인 경우만)
+            "first_luck_age": first_luck_age,  # ✅ [NEW] 대운 시작 나이
+            "daewoon_by_age": daewoon_by_age,  # ✅ [NEW] 나이대별 대운 정보 (년도, 십성, 십이운성 포함) - 위에서 계산된 값 재사용
             "yinYang": yinYang,
             "fiveElement": fiveElement,
             "session_id": session_id,      # 필요 시 상위에서 실제 세션 주입
             "question": question,
+            
+            # ✅ [NEW] 십성 정보 (상세)
+            "sipseong_detail": {
+                "yearGan": yearGan,
+                "yearJi": yearJi,
+                "wolGan": wolGan,
+                "wolJi": wolJi,
+                "ilGan": ilGan,
+                "ilJi": ilJi,
+                "siGan": siGan,
+                "siJi": siJi,
+                "currDaewoonGan": currDwGan,
+                "currDaewoonJi": currDwJi,
+            },
 
             # 🔥 요약 엔진에서 바로 읽어갈 수 있는 엔티티 블록
             "entities": {
@@ -415,7 +720,8 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         }
     }
     payload["target_times"] = target_times
-    print(f"focus meta 대운 : ${payload["meta"]["daewoon"]}")
+    print(f"focus meta 대운 : ${daewoon_str}, 대운시작나이: {first_luck_age}, 모드: {mode}")
+    
     mirror_target_times_to_legacy(payload)
     #print(f"compare_items : {compare_items}, target_times : {target_times}")
     
@@ -433,16 +739,47 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
 
     # 기존 보유 헬퍼 재사용
     # stem_from_any("乙巳") -> "乙", branch_from_any("乙巳") -> "巳"
+    
+    # 대운이 매칭되었으면 resolved.flow_now.daewoon도 업데이트
+    resolved_daewoon_ganji = current_dw
+    resolved_daewoon_stem = stem_from_any(current_dw) if current_dw else None
+    resolved_daewoon_branch = branch_from_any(current_dw) if current_dw else None
+    resolved_daewoon_sipseong = dw_sip_gan
+    resolved_daewoon_sipseong_branch = dw_sip_br
+    resolved_daewoon_sibi_unseong = curr_dw_sibi
+    
+    if matched_daewoon:
+        resolved_daewoon_ganji = matched_daewoon.get("daewoon")
+        resolved_daewoon_stem = stem_from_any(resolved_daewoon_ganji) if resolved_daewoon_ganji else None
+        resolved_daewoon_branch = branch_from_any(resolved_daewoon_ganji) if resolved_daewoon_ganji else None
+        
+        # 대운 십성/십이운성을 무조건 재계산하여 확실하게 설정 (일간 기준)
+        if resolved_daewoon_ganji and day_stem_hj:
+            dw_sip_gan_new, dw_sip_br_new = _sipseong_split_for_target(day_stem_hj, resolved_daewoon_ganji)
+            # 재계산된 값으로 확실하게 업데이트
+            resolved_daewoon_sipseong = dw_sip_gan_new
+            resolved_daewoon_sipseong_branch = dw_sip_br_new
+            # 십이운성 재계산
+            if resolved_daewoon_branch:
+                resolved_daewoon_sibi_unseong = unseong_for(day_stem_hj, resolved_daewoon_branch) if day_stem_hj else None
+            else:
+                resolved_daewoon_sibi_unseong = None
+        else:
+            # 일간이 없으면 matched_daewoon의 기존 값 사용
+            resolved_daewoon_sipseong = matched_daewoon.get("sipseong")
+            resolved_daewoon_sipseong_branch = matched_daewoon.get("sipseong_branch")
+            resolved_daewoon_sibi_unseong = matched_daewoon.get("sibi_unseong")
+    
     payload["resolved"] = {
         "pillars": resolved_pillars,
         "flow_now": {
             "daewoon": {
-                "ganji": current_dw or None,
-                "stem":  stem_from_any(current_dw)   if current_dw else None,
-                "branch":branch_from_any(current_dw) if current_dw else None,
-                "sipseong":        dw_sip_gan,   # ✅ 대운 '천간' 기준 십성
-                "sipseong_branch": dw_sip_br,    # ✅ 대운 '지지' 기준 십성 (신규)
-                "sibi_unseong":    curr_dw_sibi, # 대운 십이운성 (지지 기반)
+                "ganji": resolved_daewoon_ganji or None,
+                "stem":  resolved_daewoon_stem or None,
+                "branch": resolved_daewoon_branch or None,
+                "sipseong":        resolved_daewoon_sipseong or None,   # ✅ 대운 '천간' 기준 십성
+                "sipseong_branch": resolved_daewoon_sipseong_branch or None,    # ✅ 대운 '지지' 기준 십성 (신규)
+                "sibi_unseong":    resolved_daewoon_sibi_unseong or None, # 대운 십이운성 (지지 기반)
             },
             "target": {
                 "year":  {

@@ -37,6 +37,8 @@ def _idx(lst, item):
         raise ValueError(f"'{item}' not in {lst}")
 
 def _norm_stem(s):
+    if not s:
+        return None               # ✅ 널 세이프
     try:
         return STEM_ALIASES[s]
     except KeyError:
@@ -93,6 +95,11 @@ def pillars_unseong(day_stem, pillars):
                   한자 가능: {'year':'辰', ...}
     """
     s = _norm_stem(day_stem)
+    
+    # ✅ day_stem이 None이면 모든 운성을 None으로 반환
+    if not s:
+        return {k: None for k in pillars.keys()}
+    
     out = {}
     for k, v in pillars.items():
         if not v:                 # ✅ None/빈값이면 그대로 None 저장
