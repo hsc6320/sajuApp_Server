@@ -27,7 +27,7 @@ from ganji_converter import Scope
 from regress_conversation import ISO_DATE_RE, KOR_ABS_DATE_RE, _db_load, _maybe_override_target_date, _today, ensure_session, record_turn_message, get_extract_chain, build_question_with_regression_context
 from converting_time import extract_target_ganji_v2, convert_relative_time, parse_korean_date_safe
 from regress_Deixis import _make_bridge, build_regression_and_deixis_context
-from sip_e_un_sung import _branch_of, unseong_for, branch_for, pillars_unseong, seun_unseong
+from sip_e_un_sung import _branch_of, unseong_for, branch_for, pillars_unseong, seun_unseong, sinsal_for, pillars_sinsal
 from Sipsin import _norm_stem, branch_from_any, get_sipshin, get_ji_sipshin_only, stem_from_any
 from choshi_64 import GUA
 from ganji_converter import get_ilju, get_wolju_from_date, get_year_ganji_from_json, JSON_PATH
@@ -209,7 +209,7 @@ llm = ChatOpenAI(
     model="gpt-4o-mini",
     timeout=25,
     max_retries=2,
-)#"gpt-3.5-turbo" 
+)#"gpt-4o-mini"
 print("✅ LLM 초기화 완료")
 
 # ============================================================================
@@ -496,7 +496,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 raw_data = req.get_data(as_text=True)
                 print(f"[DEBUG] 요청 본문 (raw): {raw_data[:200] if raw_data else '(empty)'}")
                 if raw_data:
-                    import json
+                    # 전역에서 이미 import된 json 모듈 사용 (함수 내부 재-import 시 UnboundLocalError 발생 가능)
                     data = json.loads(raw_data)
                 else:
                     data = {}
@@ -915,6 +915,72 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         print(f"   대운간/대운지: {currDaewoonGan}/{currDaewoonJi}")
         print(f"   전체 sipseong_info 객체: {json.dumps(sipseong_info, ensure_ascii=False)}")
         print("-" * 80)
+        # 십이신살 계산 및 출력
+        try:
+            from sip_e_un_sung import pillars_sinsal
+            from Sipsin import branch_from_any
+            
+            # 일지 추출 (일주에서 지지 추출)
+            day_branch = branch_from_any(day) if day else None
+            
+            if day_branch:
+                # 년/월/일/시 지지 추출
+                pillars_branches = {
+                    "year":  branch_from_any(year) if year else None,
+                    "month": branch_from_any(month) if month else None,
+                    "day":   branch_from_any(day) if day else None,
+                    "hour":  branch_from_any(pillar_hour) if pillar_hour else None,
+                }
+                
+                # 십이신살 계산 (일지 기준)
+                sinsal_map = pillars_sinsal(day_branch, pillars_branches)
+                
+                print(f"🔮 십이신살 정보 (일지={day_branch} 기준):")
+                if sinsal_map.get("year"):
+                    print(f"   년지({pillars_branches.get('year')}): {sinsal_map.get('year')}")
+                if sinsal_map.get("month"):
+                    print(f"   월지({pillars_branches.get('month')}): {sinsal_map.get('month')}")
+                if sinsal_map.get("day"):
+                    print(f"   일지({pillars_branches.get('day')}): {sinsal_map.get('day')}")
+                if sinsal_map.get("hour"):
+                    print(f"   시지({pillars_branches.get('hour')}): {sinsal_map.get('hour')}")
+                
+                # 전체 신살 맵 출력
+                print(f"   전체 십이신살 맵: {json.dumps(sinsal_map, ensure_ascii=False)}")
+            else:
+                print(f"🔮 십이신살 정보: 일지 추출 실패 (일주={day})")
+        except Exception as e:
+            print(f"🔮 십이신살 계산 중 오류: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # 4대 흉살 계산 및 출력
+        try:
+            from sip_e_un_sung import check_4dae_hyungsal
+            hyungsal_result = check_4dae_hyungsal(year, month, day, pillar_hour)
+            
+            print(f"⚔️ 4대 흉살 정보:")
+            if hyungsal_result.get("baekhosal"):
+                print(f"   백호살: {', '.join(hyungsal_result.get('baekhosal', []))}")
+            if hyungsal_result.get("goegangsal"):
+                print(f"   괴강살: {', '.join(hyungsal_result.get('goegangsal', []))}")
+            if hyungsal_result.get("yanginsal"):
+                print(f"   양인살: {', '.join(hyungsal_result.get('yanginsal', []))}")
+            if hyungsal_result.get("guimungwansal"):
+                print(f"   귀문관살: {', '.join(hyungsal_result.get('guimungwansal', []))}")
+            
+            # 전체 4대 흉살 맵 출력
+            has_any = any(hyungsal_result.values())
+            if not has_any:
+                print(f"   (4대 흉살 없음)")
+            else:
+                print(f"   전체 4대 흉살 맵: {json.dumps(hyungsal_result, ensure_ascii=False)}")
+        except Exception as e:
+            print(f"⚔️ 4대 흉살 계산 중 오류: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        print("-" * 80)
         print(f"❓ 질문:")
         print(f"   원본: {question}")
         print(f"   변환 후: {updated_question}")
@@ -1299,8 +1365,19 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 config={"configurable": {"session_id": session_id}},
             )
             answer_text = getattr(result, "content", str(result))
-            #print(f"counseling_prompt : {counseling_prompt}")
-            #print(f"result: {result}") openAI 응답 출력
+
+            # ✅ 토큰 사용량 로깅 (gpt-4o-mini 기준)
+            usage = getattr(result, "usage_metadata", None) or getattr(result, "response_metadata", {}).get("token_usage") if hasattr(result, "response_metadata") else None
+            try:
+                if isinstance(usage, dict):
+                    in_tok = usage.get("input_tokens") or usage.get("prompt_tokens")
+                    out_tok = usage.get("output_tokens") or usage.get("completion_tokens")
+                    total_tok = usage.get("total_tokens") or (in_tok or 0) + (out_tok or 0)
+                    print(f"[USAGE][COUNSEL] model=gpt-4o-mini input={in_tok} output={out_tok} total={total_tok}")
+                else:
+                    print(f"[USAGE][COUNSEL] usage_metadata 없음 또는 형식 미지원: {usage}")
+            except Exception as ue:
+                print(f"[USAGE][COUNSEL] 토큰 로깅 중 예외: {ue}")
             
             # 메모리 저장(옵션)
             record_turn(updated_question, result.content, payload=user_payload)

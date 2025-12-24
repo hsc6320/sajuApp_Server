@@ -9,7 +9,7 @@ from ganjiArray import extract_comparison_slices, format_comparison_block, parse
 from ganji_converter import Scope, get_ilju, get_wolju_from_date, get_year_ganji_from_json, JSON_PATH
 from regress_conversation import get_extract_chain, _today, _maybe_override_target_date
 from converting_time import extract_target_ganji_v2, convert_relative_time, parse_korean_date_safe, is_month_only_question
-from sip_e_un_sung import _branch_of, unseong_for, branch_for, pillars_unseong, seun_unseong
+from sip_e_un_sung import _branch_of, unseong_for, branch_for, pillars_unseong, seun_unseong, sinsal_for, pillars_sinsal, check_4dae_hyungsal
 from Sipsin import _norm_stem, branch_from_any, get_sipshin, get_ji_sipshin_only, stem_from_any
 from datetime import datetime
 
@@ -114,7 +114,7 @@ def style_seed_from_payload(payload: dict) -> int:
     return int(hashlib.md5(key.encode("utf-8")).hexdigest(), 16) % 10_000
 
 # ── target_times → legacy(target_time, resolved.flow_now.target) 미러 ──
-_TARGET_KEYS = ("ganji", "stem", "branch", "sipseong", "sipseong_branch", "sibi_unseong")
+_TARGET_KEYS = ("ganji", "stem", "branch", "sipseong", "sipseong_branch", "sibi_unseong", "sinsal")
 _SCOPES      = ("year", "month", "day", "hour")
 
 def _as_legacy_slot(entry: dict) -> dict:
@@ -245,7 +245,7 @@ def calculate_daewoon_by_age(daewoon_list: List[str], first_luck_age: Optional[i
     
     return result
 
-def _entry_from_known(day_stem_hj, scope: str, g: Optional[str], sip_gan, sip_br, sibi) -> Optional[dict]:
+def _entry_from_known(day_stem_hj, scope: str, g: Optional[str], sip_gan, sip_br, sibi, sinsal=None) -> Optional[dict]:
     if not g:
         return None
     return {
@@ -257,6 +257,7 @@ def _entry_from_known(day_stem_hj, scope: str, g: Optional[str], sip_gan, sip_br
         "sipseong":        sip_gan,    # 천간 기준 십성
         "sipseong_branch": sip_br,     # 지지 기준 십성
         "sibi_unseong":    sibi,       # 지지 기반 십이운성
+        "sinsal":          sinsal,     # 일지 기준 십이신살
     }
 
 def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
@@ -377,6 +378,11 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     target_sibi_map = pillars_unseong(day_stem_hj, pillars_branches) if day_stem_hj else {k: None for k in pillars_branches}
     # 예: {'year': '관대', 'month': '절', 'day': None, 'hour': '장생'}
 
+    # === [C] 타겟(연/월/일/시) 십이신살 맵 (일지 기준)
+    day_branch = branch_from_any(day)  # 일지 추출
+    target_sinsal_map = pillars_sinsal(day_branch, pillars_branches) if day_branch else {k: None for k in pillars_branches}
+    # 예: {'year': '연살', 'month': '월살', 'day': None, 'hour': '장성살'}
+
     # === [B] 현재 대운 십이운성 (★ _branch_of → branch_from_any)
     print(f"current_dw : {current_dw}")
     current_dw_branch = branch_from_any(current_dw)  # 예: '亥' 또는 None
@@ -401,16 +407,16 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
 
     # 기본 1건(있을 때만)
     if t_year_ganji:
-        e = _entry_from_known(day_stem_hj, "year",  t_year_ganji,  year_sip_gan,  year_sip_br,  target_sibi_map.get("year"))
+        e = _entry_from_known(day_stem_hj, "year",  t_year_ganji,  year_sip_gan,  year_sip_br,  target_sibi_map.get("year"), target_sinsal_map.get("year"))
         if e: target_times.append(e)
     if t_month_ganji:
-        e = _entry_from_known(day_stem_hj, "month", t_month_ganji, month_sip_gan, month_sip_br, target_sibi_map.get("month"))
+        e = _entry_from_known(day_stem_hj, "month", t_month_ganji, month_sip_gan, month_sip_br, target_sibi_map.get("month"), target_sinsal_map.get("month"))
         if e: target_times.append(e)
     if t_day_ganji:
-        e = _entry_from_known(day_stem_hj, "day",   t_day_ganji,   day_sip_gan,   day_sip_br,   target_sibi_map.get("day"))
+        e = _entry_from_known(day_stem_hj, "day",   t_day_ganji,   day_sip_gan,   day_sip_br,   target_sibi_map.get("day"), target_sinsal_map.get("day"))
         if e: target_times.append(e)
     if t_hour_ganji:
-        e = _entry_from_known(day_stem_hj, "hour",  t_hour_ganji,  hour_sip_gan,  hour_sip_br,  target_sibi_map.get("hour"))
+        e = _entry_from_known(day_stem_hj, "hour",  t_hour_ganji,  hour_sip_gan,  hour_sip_br,  target_sibi_map.get("hour"), target_sinsal_map.get("hour"))
         if e: target_times.append(e)
 
     # 비교 질문 파싱(간지/연/월/일)
@@ -421,6 +427,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         if any(e.get("scope") == "year" and e.get("ganji") == gj for e in target_times):
             continue
         sip_gan, sip_br = _sipseong_split_for_target(day_stem_hj, gj)
+        gj_branch = branch_from_any(gj)
         entry = {
             "label": f"{gj} 연운",
             "scope": "year",
@@ -429,7 +436,8 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
             "branch":branch_from_any(gj),
             "sipseong":        sip_gan,
             "sipseong_branch": sip_br,
-            "sibi_unseong":    (unseong_for(day_stem_hj, branch_from_any(gj)) if (day_stem_hj and branch_from_any(gj)) else None),
+            "sibi_unseong":    (unseong_for(day_stem_hj, gj_branch) if (day_stem_hj and gj_branch) else None),
+            "sinsal":          (sinsal_for(day_branch, gj_branch) if (day_branch and gj_branch) else None),
         }
         target_times.append(entry)
 
@@ -442,6 +450,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         if any(e.get("scope") == "year" and e.get("ganji") == gj for e in target_times):
             continue
         sip_gan, sip_br = _sipseong_split_for_target(day_stem_hj, gj)
+        gj_branch = branch_from_any(gj)
         entry = {
             "label": f"{y}년",
             "scope": "year",
@@ -450,7 +459,8 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
             "branch":branch_from_any(gj),
             "sipseong":        sip_gan,
             "sipseong_branch": sip_br,
-            "sibi_unseong":    (unseong_for(day_stem_hj, branch_from_any(gj)) if (day_stem_hj and branch_from_any(gj)) else None),
+            "sibi_unseong":    (unseong_for(day_stem_hj, gj_branch) if (day_stem_hj and gj_branch) else None),
+            "sinsal":          (sinsal_for(day_branch, gj_branch) if (day_branch and gj_branch) else None),
         }
         target_times.append(entry)
 
@@ -462,6 +472,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         if not gj:
             continue
         sip_gan, sip_br = _sipseong_split_for_target(day_stem_hj, gj)
+        gj_branch = branch_from_any(gj)
         entry = {
             "label": f"{y}년 {m}월",
             "scope": "month",
@@ -470,7 +481,8 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
             "branch":branch_from_any(gj),
             "sipseong":        sip_gan,
             "sipseong_branch": sip_br,
-            "sibi_unseong":    (unseong_for(day_stem_hj, branch_from_any(gj)) if (day_stem_hj and branch_from_any(gj)) else None),
+            "sibi_unseong":    (unseong_for(day_stem_hj, gj_branch) if (day_stem_hj and gj_branch) else None),
+            "sinsal":          (sinsal_for(day_branch, gj_branch) if (day_branch and gj_branch) else None),
         }
         target_times.append(entry)
 
@@ -484,6 +496,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         if not gj:
             continue
         sip_gan, sip_br = _sipseong_split_for_target(day_stem_hj, gj)
+        gj_branch = branch_from_any(gj)
         entry = {
             "label": f"{y}년 {m}월 {d}일",
             "scope": "day",
@@ -492,7 +505,8 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
             "branch":branch_from_any(gj),
             "sipseong":        sip_gan,
             "sipseong_branch": sip_br,
-            "sibi_unseong":    (unseong_for(day_stem_hj, branch_from_any(gj)) if (day_stem_hj and branch_from_any(gj)) else None),
+            "sibi_unseong":    (unseong_for(day_stem_hj, gj_branch) if (day_stem_hj and gj_branch) else None),
+            "sinsal":          (sinsal_for(day_branch, gj_branch) if (day_branch and gj_branch) else None),
         }
         target_times.append(entry)
 
@@ -619,6 +633,9 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                         curr_dw_sibi = unseong_for(day_stem_hj, matched_dw_branch) if day_stem_hj else None
         print(f"[make_saju_payload] ✅ 대운 정보 업데이트: {current_dw} (십성: {dw_sip_gan}/{dw_sip_br}, 십이운성: {curr_dw_sibi})")
 
+    # === 4대 흉살 계산 ===
+    hyungsal_result = check_4dae_hyungsal(year, month, day, pillar_hour)
+
     # 최종 스키마 구성
     payload = {
         "saju": {
@@ -633,6 +650,12 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                 "month": wolGan or None,
                 "day": ilGan or None,
                 "hour": siGan or None,
+            },
+            "hyungsal_4dae": {  # ✅ 4대 흉살 정보
+                "baekhosal": hyungsal_result.get("baekhosal", []),
+                "goegangsal": hyungsal_result.get("goegangsal", []),
+                "yanginsal": hyungsal_result.get("yanginsal", []),
+                "guimungwansal": hyungsal_result.get("guimungwansal", [])
             }
         },
         # === 현재 대운 ===
@@ -653,6 +676,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                 "sipseong":        year_sip_gan,                              # ✅ 천간 기준 십성
                 "sipseong_branch": year_sip_br,                               # ✅ 지지 기준 십성
                 "sibi_unseong":    target_sibi_map.get("year"),               # ✅ 지지 기반 십이운성
+                "sinsal":          target_sinsal_map.get("year"),             # ✅ 일지 기준 십이신살
             },
             "month": {
                 "ganji": t_month_ganji,
@@ -661,6 +685,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                 "sipseong":        month_sip_gan,
                 "sipseong_branch": month_sip_br,
                 "sibi_unseong":    target_sibi_map.get("month"),
+                "sinsal":          target_sinsal_map.get("month"),
             },
             "day": {
                 "ganji": t_day_ganji,
@@ -669,6 +694,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                 "sipseong":        day_sip_gan,
                 "sipseong_branch": day_sip_br,
                 "sibi_unseong":    target_sibi_map.get("day"),
+                "sinsal":          target_sinsal_map.get("day"),
             },
             "hour": {
                 "ganji": t_hour_ganji,
@@ -677,6 +703,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                 "sipseong":        hour_sip_gan,
                 "sipseong_branch": hour_sip_br,
                 "sibi_unseong":    target_sibi_map.get("hour"),
+                "sinsal":          target_sinsal_map.get("hour"),
             },
         },
 
@@ -789,6 +816,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                     "sipseong":        year_sip_gan,    # ✅ 연운 '천간' 기준 십성
                     "sipseong_branch": year_sip_br,     # ✅ 연운 '지지' 기준 십성 (신규)
                     "sibi_unseong":    target_sibi_map.get("year"),
+                    "sinsal":          target_sinsal_map.get("year"),  # ✅ 일지 기준 십이신살
                 },
                 "month": {
                     "ganji":   t_month_ganji,
@@ -797,6 +825,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                     "sipseong":        month_sip_gan,   # ✅ 월운 '천간' 기준 십성
                     "sipseong_branch": month_sip_br,    # ✅ 월운 '지지' 기준 십성 (신규)
                     "sibi_unseong":    target_sibi_map.get("month"),
+                    "sinsal":          target_sinsal_map.get("month"),
                 },
                 "day":   {
                     "ganji":   t_day_ganji,
@@ -805,6 +834,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                     "sipseong":        day_sip_gan,     # ✅ 일운 '천간' 기준 십성
                     "sipseong_branch": day_sip_br,      # ✅ 일운 '지지' 기준 십성 (신규)
                     "sibi_unseong":    target_sibi_map.get("day"),
+                    "sinsal":          target_sinsal_map.get("day"),
                 },
                 "hour":  {
                     "ganji":   t_hour_ganji,
@@ -813,12 +843,14 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                     "sipseong":        hour_sip_gan,    # ✅ 시운 '천간' 기준 십성
                     "sipseong_branch": hour_sip_br,     # ✅ 시운 '지지' 기준 십성 (신규)
                     "sibi_unseong":    target_sibi_map.get("hour"),
+                    "sinsal":          target_sinsal_map.get("hour"),
                 },
             }
         },
         "canon": {
             "sipseong_vocab": ["비견","겁재","식신","상관","편재","정재","편관","정관","편인","정인"],
-            "sibi_vocab":     ["장생","목욕","관대","건록","제왕","쇠","병","사","묘","절","태","양"]
+            "sibi_vocab":     ["장생","목욕","관대","건록","제왕","쇠","병","사","묘","절","태","양"],
+            "sinsal_vocab":   ["겁살","재살","천살","지살","연살","월살","망신살","장성살","반안살","역마살","육해살","화개살"]
         }
     }
 
