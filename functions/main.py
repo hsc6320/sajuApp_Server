@@ -587,6 +587,81 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         # [ADD] 앱 UID (새로운 경로 구조용)
         app_uid = (data.get("app_uid") or data.get("appUid") or data.get("uid") or "").strip()
         
+        # ✅ [NEW] 개인맞춤입력 정보 (사주 구조 계산에는 사용하지 않음, 해석·조언의 현실 적합도 보정용 context로만 사용)
+        # 디버깅: 프론트엔드에서 보낸 개인맞춤입력 관련 키 확인
+        personal_info_keys = ["jobStatus", "jobName", "maritalStatus", "concerns", "lifeStage", 
+                             "moneyActivity", "relationshipStatus", "hobbies", "traits", 
+                             "hasHealthConcern", "note"]
+        found_keys = [key for key in personal_info_keys if key in data and data.get(key) not in (None, "", [])]
+        
+        # personalInfo 또는 personal_info 같은 중첩 객체로 올 수도 있음
+        personal_info_obj = None
+        if "personalInfo" in data:
+            print(f"[DEBUG] 'personalInfo' 객체 발견: {json.dumps(data.get('personalInfo'), ensure_ascii=False)}")
+            personal_info_obj = data.get("personalInfo") or {}
+        elif "personal_info" in data:
+            print(f"[DEBUG] 'personal_info' 객체 발견: {json.dumps(data.get('personal_info'), ensure_ascii=False)}")
+            personal_info_obj = data.get("personal_info") or {}
+        
+        if found_keys:
+            print(f"[DEBUG] 개인맞춤입력 관련 키 발견 (루트 레벨): {found_keys}")
+            # 루트 레벨에서 직접 가져오기
+            personal_info = {
+                # A. 필수
+                "jobStatus": data.get("jobStatus") or None,
+                "jobName": data.get("jobName") or None,
+                "maritalStatus": data.get("maritalStatus") or None,
+                "concerns": data.get("concerns") or [],
+                # B. 권장
+                "lifeStage": data.get("lifeStage") or None,
+                "moneyActivity": data.get("moneyActivity") or None,
+                "relationshipStatus": data.get("relationshipStatus") or None,
+                # C. 보조(선택)
+                "hobbies": data.get("hobbies") or [],
+                "traits": data.get("traits") or {},
+                # D. 민감(제한 입력)
+                "hasHealthConcern": data.get("hasHealthConcern") if "hasHealthConcern" in data else None,
+                # E. 기타사항(선택)
+                "note": data.get("note") or None,
+            }
+        elif personal_info_obj:
+            print(f"[DEBUG] 중첩 객체에서 개인맞춤입력 정보 추출")
+            # 중첩 객체에서 가져오기
+            personal_info = {
+                "jobStatus": personal_info_obj.get("jobStatus") or None,
+                "jobName": personal_info_obj.get("jobName") or None,
+                "maritalStatus": personal_info_obj.get("maritalStatus") or None,
+                "concerns": personal_info_obj.get("concerns") or [],
+                "lifeStage": personal_info_obj.get("lifeStage") or None,
+                "moneyActivity": personal_info_obj.get("moneyActivity") or None,
+                "relationshipStatus": personal_info_obj.get("relationshipStatus") or None,
+                "hobbies": personal_info_obj.get("hobbies") or [],
+                "traits": personal_info_obj.get("traits") or {},
+                "hasHealthConcern": personal_info_obj.get("hasHealthConcern") if "hasHealthConcern" in personal_info_obj else None,
+                "note": personal_info_obj.get("note") or None,
+            }
+        else:
+            print(f"[DEBUG] 개인맞춤입력 관련 키 없음. data의 모든 키: {list(data.keys())}")
+            # 루트 레벨에서 직접 가져오기 (기본값으로 빈 값)
+            personal_info = {
+                # A. 필수
+                "jobStatus": data.get("jobStatus") or None,
+                "jobName": data.get("jobName") or None,
+                "maritalStatus": data.get("maritalStatus") or None,
+                "concerns": data.get("concerns") or [],
+                # B. 권장
+                "lifeStage": data.get("lifeStage") or None,
+                "moneyActivity": data.get("moneyActivity") or None,
+                "relationshipStatus": data.get("relationshipStatus") or None,
+                # C. 보조(선택)
+                "hobbies": data.get("hobbies") or [],
+                "traits": data.get("traits") or {},
+                # D. 민감(제한 입력)
+                "hasHealthConcern": data.get("hasHealthConcern") if "hasHealthConcern" in data else None,
+                # E. 기타사항(선택)
+                "note": data.get("note") or None,
+            }
+        
         # [NEW] 이 요청 동안만 '해당 사용자' 파일로 라우팅되도록 켠다
         #       (Cloud Run/Functions 재사용 프로세스 대비, 요청 끝나면 반드시 해제)
         
@@ -980,6 +1055,59 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             import traceback
             traceback.print_exc()
         
+        # ✅ [NEW] 개인맞춤입력 정보 로그 출력
+        print("-" * 80)
+        print(f"👤 개인맞춤입력 정보:")
+        if personal_info and any(v for v in personal_info.values() if v):
+            # A. 필수
+            if personal_info.get("jobStatus"):
+                print(f"   직업 상태: {personal_info.get('jobStatus')}")
+            if personal_info.get("jobName"):
+                print(f"   직업명: {personal_info.get('jobName')}")
+            if personal_info.get("maritalStatus"):
+                print(f"   혼인 상태: {personal_info.get('maritalStatus')}")
+            if personal_info.get("concerns"):
+                concerns_list = personal_info.get("concerns", [])
+                if isinstance(concerns_list, list) and concerns_list:
+                    print(f"   현재 고민 영역: {', '.join(concerns_list)}")
+            
+            # B. 권장
+            if personal_info.get("lifeStage"):
+                print(f"   현재 삶의 단계: {personal_info.get('lifeStage')}")
+            if personal_info.get("moneyActivity"):
+                print(f"   재물 활동: {personal_info.get('moneyActivity')}")
+            if personal_info.get("relationshipStatus"):
+                print(f"   연애 상태: {personal_info.get('relationshipStatus')}")
+            
+            # C. 보조(선택)
+            if personal_info.get("hobbies"):
+                hobbies_list = personal_info.get("hobbies", [])
+                if isinstance(hobbies_list, list) and hobbies_list:
+                    print(f"   취미 성향: {', '.join(hobbies_list)}")
+            if personal_info.get("traits"):
+                traits_dict = personal_info.get("traits", {})
+                if isinstance(traits_dict, dict) and traits_dict:
+                    traits_str = ", ".join([f"{k}: {v}" for k, v in traits_dict.items() if v])
+                    if traits_str:
+                        print(f"   성향 자각: {traits_str}")
+            
+            # D. 민감(제한 입력)
+            if personal_info.get("hasHealthConcern") is not None:
+                health_status = "있음" if personal_info.get("hasHealthConcern") else "없음"
+                print(f"   건강 이슈 존재 여부: {health_status}")
+            
+            # E. 기타사항(선택)
+            if personal_info.get("note"):
+                note_text = personal_info.get("note", "")
+                if len(note_text) > 200:
+                    note_text = note_text[:200] + "..."
+                print(f"   기타 메모: {note_text}")
+            
+            # 전체 객체도 JSON으로 출력 (디버깅용)
+            print(f"   전체 객체: {json.dumps(personal_info, ensure_ascii=False)}")
+        else:
+            print(f"   (개인맞춤입력 정보 없음)")
+        
         print("-" * 80)
         print(f"❓ 질문:")
         print(f"   원본: {question}")
@@ -1193,6 +1321,8 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
 
             focus = data.get("focus") or "종합운"
 
+            # ✅ [NEW] personal_info를 data에 포함시켜 make_saju_payload에 전달
+            data["personal_info"] = personal_info
 
             user_payload = make_saju_payload(data, focus, updated_question)
             # ✅ app_uid를 payload에 추가 (record_turn_message에서 사용)
@@ -1344,8 +1474,90 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             if comparison_block:
                 comparison_context = f"\n\n[비교 입력]\n{comparison_block}\n"
             
-            # context에 나이대별 대운 정보와 comparison_block 추가
-            enhanced_context = reg_prompt + daewoon_context + comparison_context
+            # ✅ [NEW] 개인맞춤입력 정보를 context에 추가 (있으면)
+            personal_info_context = ""
+            personal_info_data = user_payload.get("meta", {}).get("personal_info", {})
+            if personal_info_data and any(v for v in personal_info_data.values() if v):
+                # 개인맞춤입력 정보가 있을 때만 context에 추가
+                personal_lines = []
+                personal_lines.append("[개인맞춤입력 정보]")
+                personal_lines.append("⚠️ 중요: 이 정보는 사주 구조(간지·십성·운) 계산에는 사용하지 않습니다.")
+                personal_lines.append("오직 해석·조언의 현실 적합도 보정용(context)으로만 사용합니다.\n")
+                
+                # A. 필수
+                if personal_info_data.get("jobStatus"):
+                    personal_lines.append(f"직업 상태: {personal_info_data.get('jobStatus')}")
+                if personal_info_data.get("jobName"):
+                    personal_lines.append(f"직업명: {personal_info_data.get('jobName')}")
+                if personal_info_data.get("maritalStatus"):
+                    personal_lines.append(f"혼인 상태: {personal_info_data.get('maritalStatus')}")
+                if personal_info_data.get("concerns"):
+                    concerns_list = personal_info_data.get("concerns", [])
+                    if isinstance(concerns_list, list) and concerns_list:
+                        personal_lines.append(f"현재 고민 영역: {', '.join(concerns_list)}")
+                
+                # B. 권장
+                if personal_info_data.get("lifeStage"):
+                    personal_lines.append(f"현재 삶의 단계: {personal_info_data.get('lifeStage')}")
+                if personal_info_data.get("moneyActivity"):
+                    personal_lines.append(f"재물 활동: {personal_info_data.get('moneyActivity')}")
+                if personal_info_data.get("relationshipStatus"):
+                    personal_lines.append(f"연애 상태: {personal_info_data.get('relationshipStatus')}")
+                
+                # C. 보조(선택)
+                if personal_info_data.get("hobbies"):
+                    hobbies_list = personal_info_data.get("hobbies", [])
+                    if isinstance(hobbies_list, list) and hobbies_list:
+                        personal_lines.append(f"취미 성향: {', '.join(hobbies_list)}")
+                if personal_info_data.get("traits"):
+                    traits_dict = personal_info_data.get("traits", {})
+                    if isinstance(traits_dict, dict) and traits_dict:
+                        traits_str = ", ".join([f"{k}: {v}" for k, v in traits_dict.items() if v])
+                        if traits_str:
+                            personal_lines.append(f"성향 자각: {traits_str}")
+                
+                # D. 민감(제한 입력)
+                if personal_info_data.get("hasHealthConcern") is not None:
+                    health_status = "있음" if personal_info_data.get("hasHealthConcern") else "없음"
+                    personal_lines.append(f"건강 이슈 존재 여부: {health_status}")
+                
+                # E. 기타사항(선택)
+                if personal_info_data.get("note"):
+                    note_text = personal_info_data.get("note", "")
+                    if len(note_text) > 200:
+                        note_text = note_text[:200] + "..."
+                    personal_lines.append(f"기타 메모: {note_text}")
+                
+                if len(personal_lines) > 1:  # "[개인맞춤입력 정보]" 헤더 외에 실제 정보가 있으면
+                    personal_info_context = "\n\n" + "\n".join(personal_lines) + "\n"
+            
+            # context에 나이대별 대운 정보, comparison_block, 개인맞춤입력 정보 추가
+            enhanced_context = reg_prompt + daewoon_context + comparison_context + personal_info_context
+            
+            # ✅ [DEBUG] 개인맞춤입력 정보가 context에 포함되었는지 확인
+            if personal_info_context:
+                print("=" * 80)
+                print("🔍 [DEBUG] LLM 프롬프트에 전달되는 개인맞춤입력 정보:")
+                print("=" * 80)
+                print(personal_info_context)
+                print("=" * 80)
+                # enhanced_context에서 개인맞춤입력 정보 부분만 추출해서 확인
+                if "[개인맞춤입력 정보]" in enhanced_context:
+                    start_idx = enhanced_context.find("[개인맞춤입력 정보]")
+                    # 개인맞춤입력 정보 섹션의 끝을 찾기 (다음 섹션이나 끝까지)
+                    end_markers = ["[CONTEXT]", "[FACTS]", "[입력 데이터(JSON)]", "[사용자 질문]"]
+                    end_idx = len(enhanced_context)
+                    for marker in end_markers:
+                        marker_idx = enhanced_context.find(marker, start_idx)
+                        if marker_idx != -1 and marker_idx < end_idx:
+                            end_idx = marker_idx
+                    personal_section = enhanced_context[start_idx:end_idx]
+                    print(f"✅ 개인맞춤입력 정보가 enhanced_context에 포함됨 (길이: {len(personal_section)} 문자)")
+                    print(f"📝 개인맞춤입력 정보 섹션 미리보기:\n{personal_section[:500]}...")
+                else:
+                    print("⚠️ [WARN] enhanced_context에 '[개인맞춤입력 정보]' 섹션이 없습니다!")
+            else:
+                print("⚠️ [DEBUG] personal_info_context가 비어있습니다. (개인맞춤입력 정보가 context에 포함되지 않음)")
             
             result = chat_with_memory.invoke(
                 {
@@ -1365,6 +1577,64 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 config={"configurable": {"session_id": session_id}},
             )
             answer_text = getattr(result, "content", str(result))
+            
+            # ✅ [DEBUG] LLM 응답에서 개인맞춤입력 정보 반영 여부 확인
+            if personal_info_data and any(v for v in personal_info_data.values() if v):
+                print("=" * 80)
+                print("🔍 [DEBUG] LLM 응답에서 개인맞춤입력 정보 반영 여부 확인:")
+                print("=" * 80)
+                # 개인맞춤입력 정보의 주요 키워드 추출
+                keywords_to_check = []
+                if personal_info_data.get("jobStatus"):
+                    keywords_to_check.append(personal_info_data.get("jobStatus"))
+                if personal_info_data.get("jobName"):
+                    keywords_to_check.append(personal_info_data.get("jobName"))
+                if personal_info_data.get("maritalStatus"):
+                    keywords_to_check.append(personal_info_data.get("maritalStatus"))
+                if personal_info_data.get("concerns"):
+                    keywords_to_check.extend(personal_info_data.get("concerns", []))
+                if personal_info_data.get("moneyActivity"):
+                    keywords_to_check.append(personal_info_data.get("moneyActivity"))
+                if personal_info_data.get("relationshipStatus"):
+                    keywords_to_check.append(personal_info_data.get("relationshipStatus"))
+                
+                # 응답에서 키워드 포함 여부 확인 (공백 제거 후 비교, 부분 매칭 지원)
+                found_keywords = []
+                answer_text_normalized = answer_text.replace(" ", "").replace("\n", "")
+                for keyword in keywords_to_check:
+                    if keyword:
+                        # 정확한 매칭
+                        if keyword in answer_text:
+                            found_keywords.append(keyword)
+                        else:
+                            # 공백 제거 후 비교 (예: "소프트웨어개발자" vs "소프트웨어 개발자")
+                            keyword_normalized = keyword.replace(" ", "")
+                            if keyword_normalized in answer_text_normalized:
+                                found_keywords.append(f"{keyword} (공백 제거 후 매칭)")
+                            else:
+                                # 부분 매칭 (키워드의 일부가 포함되어 있는지)
+                                # 예: "직업/커리어" -> "직업" 또는 "커리어"가 포함되어 있으면
+                                if "/" in keyword:
+                                    parts = keyword.split("/")
+                                    for part in parts:
+                                        if part in answer_text:
+                                            found_keywords.append(f"{keyword} (부분 매칭: {part})")
+                                            break
+                
+                if found_keywords:
+                    print(f"✅ 개인맞춤입력 정보가 응답에 반영됨!")
+                    print(f"   발견된 키워드: {', '.join(found_keywords)}")
+                    print(f"   전체 키워드: {', '.join(keywords_to_check)}")
+                else:
+                    print(f"⚠️ 개인맞춤입력 정보 키워드가 응답에 직접 언급되지 않음")
+                    print(f"   확인한 키워드: {', '.join(keywords_to_check)}")
+                    print(f"   (키워드가 직접 언급되지 않아도 맥락적으로 반영되었을 수 있음)")
+                
+                # 응답의 일부 미리보기
+                preview_length = min(300, len(answer_text))
+                print(f"\n📝 응답 미리보기 (처음 {preview_length}자):")
+                print(answer_text[:preview_length] + "..." if len(answer_text) > preview_length else answer_text)
+                print("=" * 80)
 
             # ✅ 토큰 사용량 로깅 (gpt-4o-mini 기준)
             usage = getattr(result, "usage_metadata", None) or getattr(result, "response_metadata", {}).get("token_usage") if hasattr(result, "response_metadata") else None

@@ -11,6 +11,7 @@ from regress_conversation import get_extract_chain, _today, _maybe_override_targ
 from converting_time import extract_target_ganji_v2, convert_relative_time, parse_korean_date_safe, is_month_only_question
 from sip_e_un_sung import _branch_of, unseong_for, branch_for, pillars_unseong, seun_unseong, sinsal_for, pillars_sinsal, check_4dae_hyungsal
 from Sipsin import _norm_stem, branch_from_any, get_sipshin, get_ji_sipshin_only, stem_from_any
+from joohu import get_joohu_flags
 from datetime import datetime
 
 def _extract_birth_year(birth_str: str) -> Optional[int]:
@@ -636,6 +637,75 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     # === 4대 흉살 계산 ===
     hyungsal_result = check_4dae_hyungsal(year, month, day, pillar_hour)
 
+    # === 조후(調候) 계산 ===
+    # 조후(調候): 월령(월주 지지)과 전체 지지 분포를 기반으로 한열조습(寒熱燥濕) 판단
+    # - 십성/십이운성의 보조 해석 레이어로 사용
+    # - "왜 체감이 다른지"에 대한 구조적 설명 제공
+    # - 결론 생성이 아닌 해석 보정용
+    # 
+    # 1) 원국 조후: 원국 기둥(년/월/일/시)만으로 계산
+    joohu_natal = get_joohu_flags(year, month, day, pillar_hour)
+    print(f"[make_saju_payload] ✅ 원국 조후 계산: {joohu_natal}")
+    
+    # 2) 대운 조후: 원국 + 대운을 합쳐서 계산 (대운이 있으면)
+    # 월령은 원국 월주를 사용하되, 오행 분포는 원국 + 대운을 합산
+    joohu_daewoon = None
+    if current_dw:
+        from joohu import calculate_joohu
+        # 월령은 원국 월주 지지를 그대로 사용
+        month_branch = branch_from_any(month) if month else None
+        # 오행 분포는 원국(년/월/일/시) + 대운을 합산
+        pillars_with_daewoon = {
+            "year": year,
+            "month": month,
+            "day": day,
+            "hour": pillar_hour,
+            "daewoon": current_dw,  # 대운 추가 (오행 집계에 포함)
+        }
+        joohu_daewoon = calculate_joohu(month_branch, pillars_with_daewoon)
+        print(f"[make_saju_payload] ✅ 대운 조후 계산 (원국+대운): {joohu_daewoon}")
+    
+    # 3) 세운(연운) 조후: 원국 + 세운을 합쳐서 계산 (세운이 있으면)
+    # 월령은 원국 월주를 사용하되, 오행 분포는 원국 + 세운을 합산
+    joohu_seun = None
+    if t_year_ganji:
+        from joohu import calculate_joohu
+        # 월령은 원국 월주 지지를 그대로 사용
+        month_branch = branch_from_any(month) if month else None
+        # 오행 분포는 원국(월/일/시) + 세운(년)을 합산
+        pillars_with_seun = {
+            "year": t_year_ganji,  # 세운으로 대체
+            "month": month,
+            "day": day,
+            "hour": pillar_hour,
+        }
+        joohu_seun = calculate_joohu(month_branch, pillars_with_seun)
+        print(f"[make_saju_payload] ✅ 세운 조후 계산 (원국+세운): {joohu_seun}")
+    
+    # 4) 월운 조후: 원국 + 월운을 합쳐서 계산 (월운이 있으면)
+    # 월령은 원국 월주를 사용하되, 오행 분포는 원국 + 월운을 합산
+    joohu_wolun = None
+    if t_month_ganji:
+        from joohu import calculate_joohu
+        # 월령은 원국 월주 지지를 그대로 사용
+        month_branch = branch_from_any(month) if month else None
+        # 오행 분포는 원국(년/일/시) + 월운(월)을 합산
+        pillars_with_wolun = {
+            "year": year,
+            "month": t_month_ganji,  # 월운으로 대체
+            "day": day,
+            "hour": pillar_hour,
+        }
+        joohu_wolun = calculate_joohu(month_branch, pillars_with_wolun)
+        print(f"[make_saju_payload] ✅ 월운 조후 계산 (원국+월운): {joohu_wolun}")
+    
+    # === 조후 데이터 payload 포함 여부 확인 (디버깅용) ===
+    print(f"[make_saju_payload] 🔍 조후 데이터 요약:")
+    print(f"   - 원국 조후: {joohu_natal}")
+    print(f"   - 대운 조후: {joohu_daewoon if joohu_daewoon else 'None (대운 없음)'}")
+    print(f"   - 세운 조후: {joohu_seun if joohu_seun else f'None (세운 없음, t_year_ganji={t_year_ganji})'}")
+    print(f"   - 월운 조후: {joohu_wolun if joohu_wolun else f'None (월운 없음, t_month_ganji={t_month_ganji})'}")
+
     # 최종 스키마 구성
     payload = {
         "saju": {
@@ -656,6 +726,33 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                 "goegangsal": hyungsal_result.get("goegangsal", []),
                 "yanginsal": hyungsal_result.get("yanginsal", []),
                 "guimungwansal": hyungsal_result.get("guimungwansal", [])
+            },
+            "joohu": {  # ✅ 조후(調候) 정보 - 해석 보정용 레이어 (원국 기준)
+                # 조후는 십성/십이운성의 보조 해석 레이어로만 사용
+                # - 십성/십이운성의 결론을 뒤집거나 부정하지 않음
+                # - "왜 체감이 다른지"에 대한 구조적 설명 제공
+                # - 프롬프트에서 "조후" 용어 노출 금지
+                # - 표현: "~한 구조라 체감이 달라질 수 있다" 형태로만 사용
+                "need_warm": joohu_natal.get("need_warm", False),   
+                # 한(寒) → 화(火) 기운이 필요한 구조
+                # (월령이 겨울이고 화 기운 부족 시 True)
+                
+                "need_cool": joohu_natal.get("need_cool", False),   
+                # 열(熱) → 수(水) 기운이 필요한 구조
+                # (월령이 여름이고 수 기운 부족 시 True)
+                
+                "need_dry": joohu_natal.get("need_dry", False),     
+                # 습(濕) → 조(燥) 기운이 필요한 구조
+                # (월령이 봄이고 금 기운 부족 시 True)
+                
+                "need_moist": joohu_natal.get("need_moist", False),  
+                # 조(燥) → 습(濕) 기운이 필요한 구조
+                # (월령이 가을이고 목 기운 부족 시 True)
+                
+                "is_balanced": joohu_natal.get("is_balanced", False),
+                # 조후가 균형 잡혀 있는 구조
+                # (계절에 필요한 기운이 충분하여 조후가 만족되는 경우 True)
+                # 예: 겨울인데 화 기운 2개 이상, 여름인데 수 기운 2개 이상 등
             }
         },
         # === 현재 대운 ===
@@ -666,6 +763,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
             "sipseong":        dw_sip_gan,                        # ✅ 일간 기준 '천간' 십성 (예: 편인)
             "sipseong_branch": dw_sip_br,                         # ✅ 일간 기준 '지지' 십성 (있으면 권장)
             "sibi_unseong":    curr_dw_sibi,                      # ✅ 일간 기준 '지지' 기반 십이운성
+            "joohu": joohu_daewoon if joohu_daewoon else None,   # ✅ 대운 조후 (원국 + 대운 합산)
         },
         # === 타겟 시점(연/월/일/시) ===
         "target_time": {
@@ -677,6 +775,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                 "sipseong_branch": year_sip_br,                               # ✅ 지지 기준 십성
                 "sibi_unseong":    target_sibi_map.get("year"),               # ✅ 지지 기반 십이운성
                 "sinsal":          target_sinsal_map.get("year"),             # ✅ 일지 기준 십이신살
+                "joohu": joohu_seun if joohu_seun else None,                  # ✅ 세운 조후 (원국 + 세운 합산)
             },
             "month": {
                 "ganji": t_month_ganji,
@@ -686,6 +785,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                 "sipseong_branch": month_sip_br,
                 "sibi_unseong":    target_sibi_map.get("month"),
                 "sinsal":          target_sinsal_map.get("month"),
+                "joohu": joohu_wolun if joohu_wolun else None,                  # ✅ 월운 조후 (원국 + 월운 합산)
             },
             "day": {
                 "ganji": t_day_ganji,
@@ -719,6 +819,9 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
             "fiveElement": fiveElement,
             "session_id": session_id,      # 필요 시 상위에서 실제 세션 주입
             "question": question,
+            
+            # ✅ [NEW] 개인맞춤입력 정보 (사주 구조 계산에는 사용하지 않음, 해석·조언의 현실 적합도 보정용 context로만 사용)
+            "personal_info": data.get("personal_info") or {},
             
             # ✅ [NEW] 십성 정보 (상세)
             "sipseong_detail": {
@@ -807,6 +910,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                 "sipseong":        resolved_daewoon_sipseong or None,   # ✅ 대운 '천간' 기준 십성
                 "sipseong_branch": resolved_daewoon_sipseong_branch or None,    # ✅ 대운 '지지' 기준 십성 (신규)
                 "sibi_unseong":    resolved_daewoon_sibi_unseong or None, # 대운 십이운성 (지지 기반)
+                "joohu": joohu_daewoon if joohu_daewoon else None,   # ✅ 대운 조후 (원국 + 대운 합산)
             },
             "target": {
                 "year":  {
@@ -817,6 +921,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                     "sipseong_branch": year_sip_br,     # ✅ 연운 '지지' 기준 십성 (신규)
                     "sibi_unseong":    target_sibi_map.get("year"),
                     "sinsal":          target_sinsal_map.get("year"),  # ✅ 일지 기준 십이신살
+                    "joohu": joohu_seun if joohu_seun else None,  # ✅ 세운 조후 (원국 + 세운 합산)
                 },
                 "month": {
                     "ganji":   t_month_ganji,
@@ -826,6 +931,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
                     "sipseong_branch": month_sip_br,    # ✅ 월운 '지지' 기준 십성 (신규)
                     "sibi_unseong":    target_sibi_map.get("month"),
                     "sinsal":          target_sinsal_map.get("month"),
+                    "joohu": joohu_wolun if joohu_wolun else None,  # ✅ 월운 조후 (원국 + 월운 합산)
                 },
                 "day":   {
                     "ganji":   t_day_ganji,
@@ -854,6 +960,16 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         }
     }
 
+    # === 조후 데이터 payload 포함 여부 최종 확인 (디버깅용) ===
+    print(f"[make_saju_payload] 🔍 조후 데이터 payload 포함 여부 확인:")
+    print(f"   - payload['natal']['joohu']: {payload.get('natal', {}).get('joohu', 'NOT FOUND')}")
+    print(f"   - payload['current_daewoon']['joohu']: {payload.get('current_daewoon', {}).get('joohu', 'NOT FOUND')}")
+    print(f"   - payload['target_time']['year']['joohu']: {payload.get('target_time', {}).get('year', {}).get('joohu', 'NOT FOUND')}")
+    print(f"   - payload['target_time']['month']['joohu']: {payload.get('target_time', {}).get('month', {}).get('joohu', 'NOT FOUND')}")
+    print(f"   - payload['resolved']['flow_now']['daewoon']['joohu']: {payload.get('resolved', {}).get('flow_now', {}).get('daewoon', {}).get('joohu', 'NOT FOUND')}")
+    print(f"   - payload['resolved']['flow_now']['target']['year']['joohu']: {payload.get('resolved', {}).get('flow_now', {}).get('target', {}).get('year', {}).get('joohu', 'NOT FOUND')}")
+    print(f"   - payload['resolved']['flow_now']['target']['month']['joohu']: {payload.get('resolved', {}).get('flow_now', {}).get('target', {}).get('month', {}).get('joohu', 'NOT FOUND')}")
+    
     return payload
 
 

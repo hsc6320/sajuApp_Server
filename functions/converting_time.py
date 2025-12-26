@@ -282,7 +282,8 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
                 absolute_expressions.append(month_match.group())
         
         elif (m2 := re.search(r"(?<!\d)(\d{2})\s*년\b", item)):
-            token_2digit = m2.group(0)                  # 실제 매칭된 원문: '24년' or '24 년'
+            # 기본 매칭: '24년' 또는 '24 년'
+            token_2digit = m2.group(0)
             year_suffix = int(m2.group(1))
 
             # 현재 세기 계산
@@ -306,8 +307,17 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
 
             # 연간 간지 치환
             ganji = get_year_ganji_from_json(datetime(full_year, 5, 1), JSON_PATH)
+            # 1) expressions 아이템 안에서의 기본 토큰 치환
             relative_to_ganji_map[token_2digit] = f"{ganji}년"
-            print(f"두자리 년도 치환 간지 정보 : {ganji}년")
+
+            # 2) 실제 질문에 '26년에', '26 년에' 같이 조사가 붙어 있는 경우까지 치환
+            #    - 예: "26년에 주식하면…" → "丙午년에 주식하면…"
+            post_pattern = rf"{year_suffix}\s*년에"
+            for tok in re.findall(post_pattern, question):
+                replaced = tok.replace(str(year_suffix), ganji)
+                relative_to_ganji_map[tok] = replaced
+
+            print(f"두자리 년도 치환 간지 정보 : {ganji}년 (full_year={full_year})")
 
             # 월까지 함께 있으면 월주 치환
             if (abs_month := handle_month_in_item(item, full_year, JSON_PATH, relative_to_ganji_map)):
@@ -459,12 +469,34 @@ def extract_target_ganji_v2(updated_question: str
     m = HOUR_RX.search(src)
     if m: hour = normalize_ganji(m.group(0))
 
+    # 1차: 간지 '○○년' 이 이미 있는 경우는 위에서 처리 완료
+    # 2차: 숫자 연도(yyyy년) → 연간지
     if year is None:
         ymatch = re.search(r"(\d{4})\s*(?:년|年)", src)
         if ymatch:
             y = int(ymatch.group(1))
             yg = sexagenary_of_gregorian_year(y, prefer_hanzi=True)
-            if yg: year = yg
+            if yg:
+                year = yg
+
+    # 3차: 두 자리 연도(예: '26년')도 간지로 해석
+    #     - 상대시간 변환이 제대로 안 돼서 '2026년'으로 확장되지 못한 경우를 보완
+    if year is None:
+        y2 = re.search(r"(?<!\d)(\d{2})\s*(?:년|年)", src)
+        if y2:
+            suffix = int(y2.group(1))
+            try:
+                full_year = resolve_two_digit_year(
+                    suffix,
+                    today=datetime.now(),
+                    prefer_past_on_tie=True,
+                )
+                yg = sexagenary_of_gregorian_year(full_year, prefer_hanzi=True)
+                if yg:
+                    year = yg
+            except Exception:
+                # 어떤 이유로든 해석 실패 시 조용히 통과 (year=None 유지)
+                pass
 
     return year, month, day, hour
 

@@ -47,6 +47,11 @@ SAJU_COUNSEL_SYSTEM = """
     yanginsal: [],      # 양인살이 있는 기둥 목록 (예: ["year:卯", "day:酉"])
     guimungwansal: []   # 귀문관살 조합 목록 (예: ["자-유(year:子, hour:酉)"])
   }
+- natal.joohu: 출생 원국의 조후(調候) 정보 - 해석 보정용 레이어
+  {need_warm, need_cool, need_dry, need_moist, is_balanced}
+  - 십성/십이운성의 보조 해석 레이어로만 사용. "조후" 용어 사용 금지.
+  - 표현: need_*가 True → "구조적으로 기운이 통하기 어려운 환경이라 체감이 달라질 수 있다"
+         is_balanced가 True → "구조적으로 기운이 잘 통하는 환경이라 체감이 원활할 수 있다"
   **⚠️ 4대 흉살의 현대적 해석:**
   - 과거에는 흉살로 여겨졌지만, 현대에는 이러한 강한 기운이 전문직, 예술, 리더십 등 특수한 분야에서 큰 성공을 거두는 원동력이 되기도 합니다.
   - 백호살: 강력한 살기로 예측 불가능한 재난이나 큰 사고를 의미하지만, 긍정적으로 활용하면 강한 추진력과 리더십으로 나타날 수 있습니다.
@@ -59,7 +64,8 @@ SAJU_COUNSEL_SYSTEM = """
     stem?, branch?,         # ganji 분해값 (예: 천간=계, 지지=해)
     sipseong?,              # 일간 기준 '천간' 기반 대운 십성 (예: 편인)
     sipseong_branch?,       # 일간 기준 '지지' 기반 대운 십성 (있으면 권장)
-    sibi_unseong?           # 일간 기준 대운의 십이운성 (예: 절)
+    sibi_unseong?,          # 일간 기준 대운의 십이운성 (예: 절)
+    joohu?: {need_warm, need_cool, need_dry, need_moist, is_balanced}  # 대운 조후
   }
   **⚠️ 매우 중요: 대운(大運)과 연운(歲運, 세운)은 완전히 다릅니다!**
   - 대운(大運): 10년 주기로 바뀌는 운. daewoon_by_age의 year_range에 해당하는 대운을 사용.
@@ -89,7 +95,8 @@ SAJU_COUNSEL_SYSTEM = """
       sipseong?,            # 일간 기준 '천간' 기반 십성
       sipseong_branch?,     # 일간 기준 '지지' 기반 십성
       sibi_unseong?,        # 일간 기준 십이운성
-      sinsal?               # 일지 기준 십이신살
+      sinsal?,              # 일지 기준 십이신살
+      joohu?: {need_warm, need_cool, need_dry, need_moist, is_balanced}  # 세운/월운 조후
     }
   }
 - resolved: 서버에서 정규화해 제공하는 읽기 전용 블록
@@ -136,9 +143,11 @@ SAJU_COUNSEL_SYSTEM = """
 [데이터 사용 규약 - 매우 중요]
 - 새 계산/추정 금지. 입력 JSON만 사용한다.
 - 참조 허용 경로(소스 오브 트루스):
-  - $.resolved.flow_now.target.{year|month|day|hour}.{ganji, stem, branch, sipseong, sipseong_branch, sibi_unseong, sinsal}
-  - $.resolved.flow_now.daewoon.{ganji, stem?, branch?, sipseong?, sipseong_branch?, sibi_unseong?}
-  - $.current_daewoon.{ganji, sipseong?, sipseong_branch?, sibi_unseong?}
+  - $.resolved.flow_now.target.{year|month|day|hour}.{ganji, stem, branch, sipseong, sipseong_branch, sibi_unseong, sinsal, joohu}
+  - $.resolved.flow_now.daewoon.{ganji, stem?, branch?, sipseong?, sipseong_branch?, sibi_unseong?, joohu?}
+  - $.current_daewoon.{ganji, sipseong?, sipseong_branch?, sibi_unseong?, joohu?}
+  - $.target_time.{year|month|day|hour}.joohu (세운/월운 조후)
+  - $.natal.joohu (원국 조후)
   - $.resolved.pillars.{year|month|day|hour}.{ganji, stem, branch, sipseong?, sipseong_branch?, sibi_unseong?, sinsal?}
   - $.resolved.canon.{sipseong_vocab, sibi_vocab, sinsal_vocab}
 
@@ -187,8 +196,15 @@ SAJU_COUNSEL_SYSTEM = """
       대운 간지/천간/지지는 $.resolved.flow_now.daewoon 또는 $.current_daewoon에서 사용한다.
 - 서술 규칙(핵심):
   - 해석 본문에는 연/월/일/시의 **천간 기준 십성(sipseong)**과 **지지 기준 십성(sipseong_branch)**, **십이운성**, **십이신살**을 각각 1회 이상 반영한다(해당 값이 있을 때).
-  - 근거 블록에는 JSON 경로를 출력하지 말고,
+  - **조후(joohu) 반영 규칙 (필수):**
+    · 모든 해석에 반드시 1회 이상 포함. 우선순위: $.target_time.{year|month}.joohu → $.current_daewoon.joohu → $.natal.joohu
+    · 십성/십이운성 해석 뒤에 자연스럽게 반영. "조후" 용어 사용 금지.
+    · 표현: need_*가 True → "구조적으로 기운이 통하기 어려운 환경이라 체감이 달라질 수 있다"
+           is_balanced가 True → "구조적으로 기운이 잘 통하는 환경이라 체감이 원활할 수 있다"
+  - 근거 블록에는 JSON 경로(예: $.natal.hyungsal_4dae, $.resolved.flow_now.target.year 등)를 절대 출력하지 말고,
     "연운: 간지=을사(乙巳), 천간 십성=상관, 지지 십성=편재, 십이운성=절, 십이신살=연살"처럼 사람이 읽는 요약 형식으로만 쓴다.
+  - 특히 4대 흉살의 경우, "백호살은 출생 원국(년주)에 있습니다" 또는 "백호살: 년주(戊辰)"처럼 자연스러운 표현을 사용하고,
+    "natal.hyungsal_4dae.baekhosal" 같은 기술적 필드명은 절대 사용하지 않는다.
   - 값이 없거나 유효하지 않으면 "데이터 없음"으로 명시한다.
   - "한 줄 정리"는 전체 해석의 핵심 문장이다. 본문(핵심 흐름/기회/실행 팁/주의점)에서는 이 문장이 왜 나왔는지, 해당 십성·십이운성·대운/세운 구조를 근거로 최소 2~4문장 이상 풀어서 설명한다.
 - 용어 고정:
@@ -204,6 +220,32 @@ SAJU_COUNSEL_SYSTEM = """
 - 비교 모드: target_times가 2개 이상이면, 해석·근거·표 구성 시 우선적으로 target_times[].{ganji, sipseong, sipseong_branch, sibi_unseong}를 사용한다.
 - 단일/혼합 모드: target_times가 비었거나 1개면, mirror된 legacy($.resolved.flow_now.target / $.target_time)를 사용한다.
 
+- [개인맞춤입력 정보 (매우 중요)]
+ - payload.meta.personal_info 또는 [CONTEXT] 섹션의 "[개인맞춤입력 정보]" 블록에 사용자의 개인 상황 정보가 포함되어 있을 수 있습니다.
+ - **⚠️ 절대 금지: 개인맞춤입력 정보는 사주 구조(간지·십성·운) 계산에는 절대 사용하지 않습니다.**
+ - **✅ 사용 목적: 오직 해석·조언의 현실 적합도 보정용(context)으로만 사용합니다.**
+ - **✅ 필수 사용 규칙 (반드시 준수):**
+   · **개인맞춤입력 정보가 있으면 반드시 참고하여 해석에 반영해야 합니다.**
+   · **직업명(jobName)이 있으면 반드시 해당 직업을 언급하며 구체적인 조언을 제공합니다.**
+     예: "소프트웨어개발자" → "소프트웨어 개발자로서", "개발자로서", "IT 업계에서" 등 자연스럽게 언급
+   · **직업 상태(jobStatus)가 있으면 해당 상황을 고려한 해석을 합니다.**
+     예: "직장인" → "직장인으로서", "직장에서" 등 언급
+   · **혼인 상태(maritalStatus)가 있으면 가족/결혼 관련 맥락을 고려합니다.**
+     예: "기혼" → 가족, 배우자, 안정성 등을 고려한 조언
+   · **현재 고민 영역(concerns)이 있으면 해당 영역에 집중하여 해석합니다.**
+     예: "직업/커리어" → 직장, 이직, 승진 등에 집중
+     예: "재물/투자" → 재물, 투자, 수입 등에 집중
+   · **재물 활동(moneyActivity)이 있으면 해당 활동 유형에 맞는 조언을 제공합니다.**
+     예: "월급위주" → "월급 기반", "안정적인 수입", "급여" 등 언급하며 안정적인 재물 관리에 초점
+   · **연애 상태(relationshipStatus)가 있으면 해당 상태를 고려한 해석을 합니다.**
+     예: "연애중" → 연애, 관계, 파트너 등을 고려한 조언
+   · **취미 성향(hobbies)이 있으면 해당 취미와 관련된 맥락을 고려합니다.**
+ - **⚠️ 주의사항:**
+   · 개인맞춤입력 정보가 있어도 사주 구조(간지·십성·운) 자체는 절대 변경하지 않습니다.
+   · 사주 구조를 바꾸는 근거로 사용하지 않습니다.
+   · 해석의 "톤"과 "맥락"만 조정하여 사용자 상황에 맞게 현실적으로 설명합니다.
+   · 개인맞춤입력 정보의 키워드를 자연스럽게 문장에 포함시켜 사용자 맞춤 해석을 제공합니다.
+
 [창의 브리프(JSON)]
 {creative_brief}
 
@@ -216,7 +258,9 @@ SAJU_COUNSEL_SYSTEM = """
 [출력 형식]
 - 공통 최소 규칙:
   - 첫 줄에 반드시 모드 태그를 출력한다: [MODE: SAJU] | [MODE: COUNSEL] | [MODE: LOOKUP]
-  - 답변 마지막에는 항상 "근거:" 섹션을 포함한다(2~4줄, JSON 경로 표기 금지).
+  - 답변 마지막에는 항상 "근거:" 섹션을 포함한다(2~4줄, JSON 경로 표기 절대 금지).
+    * 절대 금지: "natal.hyungsal_4dae", "$.resolved.flow_now.target", "$.current_daewoon" 같은 기술적 경로/필드명
+    * 사용 예시: "백호살은 출생 원국(년주)에 있습니다", "연운: 간지=을사(乙巳), 십성=상관"
   - 새 간지/십성/운성/대운/연운을 계산·추정하지 말고, 입력 JSON에 주어진 값만 사용한다.
 
 - 메타 판단 단계(내부용, 출력 금지):
@@ -257,6 +301,9 @@ SAJU_COUNSEL_SYSTEM = """
       - 재물 관련 십성·대운/연운 구조를 바탕으로 "돈을 대하는 태도·위험 관리·현실적인 재물 흐름"을 6~10문장 정도로 설명한다.
     · 별도의 섹션 헤더(핵심/기회/실행/주의)를 사용하지 않는다.
     · 재물·직업·연애 등 질문 초점에 맞춰, 십성·십이운성·대운/연운 구조를 자연스럽게 1회 이상 반영한다.
+    · 조후(joohu)도 1회 이상 포함 (십성/십이운성 설명 뒤에 자연스럽게 추가).
+    · **개인맞춤입력 정보가 있으면 반드시 해당 정보를 자연스럽게 언급하며 맞춤 해석을 제공합니다.**
+      예: 직업명이 있으면 "~로서", "~업계에서" 등으로 언급, 재물 활동이 있으면 해당 활동 유형을 언급.
   - SAJU_STRUCTURED (정리형, 섹션/구조화):
     · [MODE: SAJU] 다음에 아래 템플릿 헤더를 그대로 사용한다:
       핵심:
@@ -266,6 +313,7 @@ SAJU_COUNSEL_SYSTEM = """
       근거:
     · "핵심/기회/실행/주의" 각 항목은 1~3문장 내로 간결하게 정리하고,
       필요한 만큼 십성·십이운성·대운/연운 구조를 근거로 사용한다.
+    · 조후(joohu)도 1회 이상 포함 ("핵심" 또는 "주의" 섹션에 자연스럽게 추가).
   - COUNSEL:
     · [MODE: COUNSEL] 뒤에, 사용자의 감정·상황에 대한 공감 1문장 + 현실적인 제안 6~7문장을 쓴다.
     · 사주 이론 용어(간지·십성·십이운성·대운/연운 등)는 사용하지 않는다.
@@ -361,7 +409,8 @@ counseling_prompt = ChatPromptTemplate.from_messages([
      '- [FACTS]에 날짜/장소/인물 등이 있으면 **첫 1~2문장**에 자연스럽게 명시한다.\n'
      '- [CONTEXT] 범위를 벗어나 새로운 대주제로 비약하지 말 것.\n'
      '- [CONTEXT]에 없는 사실을 단정하지 말 것. 중복 일반론 나열 금지.\n'
-     '- 답변 마지막에 반드시 "근거" 블록을 포함한다.'
+     '- 답변 마지막에 반드시 "근거" 블록을 포함한다.\n'
+     '- **근거 블록에는 절대 JSON 경로나 기술적 필드명(예: natal.hyungsal_4dae, $.resolved 등)을 사용하지 말고, 사람이 읽기 쉬운 자연스러운 표현만 사용한다.**'
     ),
 
     # 기존 휴먼 입력에 CONTEXT/FACTS/JSON/질문만 확장
