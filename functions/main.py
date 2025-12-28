@@ -12,6 +12,7 @@ import time
 from conv_store import (
     set_current_user_context,
     make_user_id_from_name,
+    make_user_key,
     delete_current_user_store,
     get_current_user_id,
     _resolve_store_path_for_user,
@@ -697,6 +698,45 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             set_current_user_context(reset=True)
             return https_fn.Response(
                 response=json.dumps({"reset": bool(ok), "user_id": uid, "path": target_path}, ensure_ascii=False),
+                status=200,
+                headers={"Content-Type": "application/json; charset=utf-8"}
+            )
+        
+        # ✅ delete_history 플래그를 유연하게 파싱 (문자/숫자/불리언 모두 허용)
+        raw_delete_history = data.get("delete_history", False)
+        delete_history_flag = False
+        if isinstance(raw_delete_history, bool):
+            delete_history_flag = raw_delete_history
+        else:
+            delete_history_flag = str(raw_delete_history).strip().lower() in ("1", "true", "t", "yes", "y")
+
+        print(f"[DELETE_HISTORY] raw={raw_delete_history!r} → flag={delete_history_flag}")
+
+        if delete_history_flag:
+            # 현재 컨텍스트의 파일을 지운다 (gs://.../<user_id>.json 또는 로컬 파일)
+            # name과 birth를 사용하여 user_id 생성 (파일명 형식: name__birth)
+            # 사용자 컨텍스트 재설정 (삭제할 파일 경로를 정확히 지정하기 위해)
+            if user_name and user_birth:
+                # name과 birth를 사용하여 user_id 생성
+                user_id_for_delete = make_user_key(user_name, user_birth)
+                set_current_user_context(
+                    name=user_name,
+                    birth=user_birth,
+                    app_uid=app_uid,
+                )
+            else:
+                # name이나 birth가 없으면 현재 컨텍스트의 user_id 사용
+                user_id_for_delete = get_current_user_id()
+            
+            uid = get_current_user_id()
+            target_path = _resolve_store_path_for_user(uid) if uid else "(no-uid)"
+            ok = delete_current_user_store()
+            print(f"[DELETE_HISTORY] delete {uid} → {target_path} → ok={ok}")
+
+            # 컨텍스트 정리 후 바로 종료(중요)
+            set_current_user_context(reset=True)
+            return https_fn.Response(
+                response=json.dumps({"delete_history": bool(ok), "user_id": uid, "path": target_path}, ensure_ascii=False),
                 status=200,
                 headers={"Content-Type": "application/json; charset=utf-8"}
             )
