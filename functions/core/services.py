@@ -246,11 +246,16 @@ def calculate_daewoon_by_age(daewoon_list: List[str], first_luck_age: Optional[i
     
     return result
 
-def _entry_from_known(day_stem_hj, scope: str, g: Optional[str], sip_gan, sip_br, sibi, sinsal=None) -> Optional[dict]:
+def _entry_from_known(day_stem_hj, scope: str, g: Optional[str], sip_gan, sip_br, sibi, sinsal=None, label_override: Optional[str] = None) -> Optional[dict]:
     if not g:
         return None
+    # label_override가 있으면 사용, 없으면 기본값 사용
+    if label_override:
+        label = label_override
+    else:
+        label = {"year":"연운","month":"월운","day":"일운","hour":"시운"}.get(scope, scope)
     return {
-        "label": {"year":"연운","month":"월운","day":"일운","hour":"시운"}.get(scope, scope),
+        "label": label,
         "scope": scope,                # "year" | "month" | "day" | "hour"
         "ganji": g,
         "stem":  stem_from_any(g),
@@ -267,6 +272,7 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     - 입력: data(dict), focus(str), updated_question(str)
     - 출력: payload(dict)
     """
+    print(f"[간지 변환] updated_question에 포함된 간지 정보: '{updated_question}'")
     # 기본 정보 (기본값 안전화)
     question   = data.get("question", "") or ""
     user_name  = data.get("name", "") or ""
@@ -350,6 +356,27 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         f"[make_saju_payload] 🎯 타겟 간지 → "
         f"year={t_year_ganji}, month={t_month_ganji}, day={t_day_ganji}, hour={t_hour_ganji}"        
     )
+    
+    # [NEW] 원본 질문에서 월 정보 추출 (label에 사용)
+    month_label_info = None
+    month_match = re.search(r"(\d{2,4})\s*(?:년|年)\s*(\d{1,2})\s*월", question)
+    if month_match:
+        try:
+            y_str = month_match.group(1)
+            m_str = month_match.group(2)
+            month_num = int(m_str)
+            if 1 <= month_num <= 12:
+                if len(y_str) == 2:
+                    from ganji_converter import resolve_two_digit_year
+                    from datetime import datetime
+                    y_suffix = int(y_str)
+                    full_year = resolve_two_digit_year(y_suffix, today=datetime.now(), prefer_past_on_tie=True)
+                else:
+                    full_year = int(y_str)
+                month_label_info = f"{full_year}년 {month_num}월"
+                print(f"[make_saju_payload] ✅ 월 label 정보 추출: {month_label_info}")
+        except Exception as e:
+            print(f"[make_saju_payload] ⚠️ 월 label 추출 실패: {e}")
 
     # 요약/엔티티 단계에서 쉽게 이용하도록 표준화
     target_ganji_list = [g for g in [t_year_ganji, t_month_ganji, t_day_ganji, t_hour_ganji] if g]
@@ -411,7 +438,9 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         e = _entry_from_known(day_stem_hj, "year",  t_year_ganji,  year_sip_gan,  year_sip_br,  target_sibi_map.get("year"), target_sinsal_map.get("year"))
         if e: target_times.append(e)
     if t_month_ganji:
-        e = _entry_from_known(day_stem_hj, "month", t_month_ganji, month_sip_gan, month_sip_br, target_sibi_map.get("month"), target_sinsal_map.get("month"))
+        # [FIX] 월 label에 실제 월 정보 포함 (예: "2026년 2월")
+        month_label = month_label_info if month_label_info else "월운"
+        e = _entry_from_known(day_stem_hj, "month", t_month_ganji, month_sip_gan, month_sip_br, target_sibi_map.get("month"), target_sinsal_map.get("month"), label_override=month_label)
         if e: target_times.append(e)
     if t_day_ganji:
         e = _entry_from_known(day_stem_hj, "day",   t_day_ganji,   day_sip_gan,   day_sip_br,   target_sibi_map.get("day"), target_sinsal_map.get("day"))
@@ -521,7 +550,6 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     target_times = dedup
 
     # === [NEW] daewoon_by_age 계산 (payload 생성 전에 미리 계산) ===
-    import re
     birth_year = _extract_birth_year(data.get("birth") or data.get("birthday") or "")
     daewoon_by_age = calculate_daewoon_by_age(
         daewoon if isinstance(daewoon, list) else [],

@@ -36,7 +36,7 @@ def _ganji_for(dt: datetime, scope: Scope, JSON_PATH: str) -> Optional[str]:
     if scope == "year":
         return get_year_ganji_from_json(dt, JSON_PATH)
     if scope == "month":
-        return get_wolju_from_date(dt, JSON_PATH)
+        return get_wolju_from_date(dt, JSON_PATH, month_only=True)  # 월 단위 질문이므로 month_only=True
     if scope == "day":
         return get_ilju(dt)
     if scope == "hour":
@@ -210,8 +210,10 @@ def _collect_year_ganji_tokens(text: str) -> list[str]:
 _GANJI_PAIR_RE = re.compile(r"[甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥]")
 
 # YYYY-MM, YYYY-MM-DD, YYYY년, YYYY년 M월 등
+# [FIX] 2자리 연도도 인식하도록 수정 (예: "26년 2월")
 _YYYY_MM_DD_RE = re.compile(r"(\d{4})[.\-년/\s]?(\d{1,2})[.\-월/\s]?(\d{1,2})[일]?")
 _YYYY_MM_RE    = re.compile(r"(\d{4})[.\-년/\s]?(\d{1,2})[.\-월]?")
+_YY_MM_RE      = re.compile(r"(?<!\d)(\d{2})\s*년\s*(\d{1,2})\s*월")  # [NEW] 2자리 연도 + 월
 _YYYY_RE       = re.compile(r"(\d{4})[.\-]?\s*년?")
 
 def parse_compare_specs(question: str) -> dict:
@@ -241,6 +243,16 @@ def parse_compare_specs(question: str) -> dict:
     for y, m in _YYYY_MM_RE.findall(q):
         try:
             months.append((int(y), int(m)))
+        except Exception:
+            pass
+    # [NEW] 2자리 연도 + 월 패턴 처리 (예: "26년 2월")
+    for y2, m in _YY_MM_RE.findall(q):
+        try:
+            from ganji_converter import resolve_two_digit_year
+            from datetime import datetime
+            year_suffix = int(y2)
+            full_year = resolve_two_digit_year(year_suffix, today=datetime.now(), prefer_past_on_tie=True)
+            months.append((full_year, int(m)))
         except Exception:
             pass
     # 일 패턴에 잡힌 것과 중복 제거

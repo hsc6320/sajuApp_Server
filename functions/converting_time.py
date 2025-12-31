@@ -55,15 +55,17 @@ def handle_relative_day_keyword_with_ilju(
     year_ganji = get_year_ganji_from_json(datetime(ty, 5, 1), json_path)  # 년주(간지만 표기)
     wolju      = get_wolju_from_date(target_date, json_path, month_only)      # [FIX] target_date 사용 (1일 고정 X)
     ilju       = get_ilju(target_date, json_path)                          # 일주(한자 2글자)
-    print(f"일주 계산 : {year_ganji}.{wolju}.{ilju}")
-
-    # 질문 치환: 년 + 월 + 일 (월/일은 “~월/~일”처럼 표기)
+    
+    # 질문 치환: 년 + 월 + 일 (월/일은 "~월/~일"처럼 표기)
     if wolju and ilju:
         relative_to_ganji_map[token] = f"{year_ganji}년 {wolju}월 {ilju}일"
+        print(f"✅ '{token}' → {target_date.strftime('%Y-%m-%d')} → {year_ganji}년 {wolju}월 {ilju}일")
     elif wolju:
         relative_to_ganji_map[token] = f"{year_ganji}년 {wolju}월"
+        print(f"✅ '{token}' → {target_date.strftime('%Y-%m-%d')} → {year_ganji}년 {wolju}월")
     else:
         relative_to_ganji_map[token] = f"{year_ganji}년"
+        print(f"✅ '{token}' → {target_date.strftime('%Y-%m-%d')} → {year_ganji}년")
 
 
 def handle_korean_month_offset(
@@ -116,7 +118,7 @@ def handle_korean_month_offset(
 
     # 연간 + 월주로 치환
     ganji_year = get_year_ganji_from_json(datetime(new_year, 5, 1), json_path)
-    wolju = get_wolju_from_date(datetime(new_year, new_month, 15), json_path) # [FIX] 1일->15일 (절기 반영)
+    wolju = get_wolju_from_date(datetime(new_year, new_month, 15), json_path, month_only=True) # [FIX] 1일->15일 (절기 반영), month_only=True 추가
     if wolju:
         relative_to_ganji_map[token] = f"{ganji_year}년 {wolju}월"
     else:
@@ -144,7 +146,8 @@ def handle_month_in_item(
     if not (1 <= month_num <= 12):
         return False
 
-    wolju = get_wolju_from_date(datetime(target_year, month_num, 15), json_path) # [FIX] 1일->15일 (절기 반영)
+    # 월 단위 질문이므로 month_only=True로 처리
+    wolju = get_wolju_from_date(datetime(target_year, month_num, 15), json_path, month_only=True) # [FIX] 1일->15일 (절기 반영), month_only=True 추가
     if not wolju:
         return None
 
@@ -362,7 +365,7 @@ def convert_relative_time(question: str, expressions: list[str], current_year: i
 
             # 연간/월주로 치환 (원하면 빼도 됨)
             ganji_year = get_year_ganji_from_json(datetime(new_year, 5, 1), JSON_PATH)
-            wolju = get_wolju_from_date(datetime(new_year, new_month, 15), JSON_PATH)  # [FIX] 15일
+            wolju = get_wolju_from_date(datetime(new_year, new_month, 15), JSON_PATH, month_only=True)  # [FIX] 15일, month_only=True 추가
             
             # 🔹 핵심: 토큰을 "연간 + 월주"로 한 번에 치환
             if wolju:
@@ -497,6 +500,10 @@ def extract_target_ganji_v2(updated_question: str
             except Exception:
                 # 어떤 이유로든 해석 실패 시 조용히 통과 (year=None 유지)
                 pass
+
+    # [NOTE] 월 간지는 convert_relative_time에서 이미 변환되어 있으므로,
+    #        MONTH_RX 패턴(468줄)으로 찾으면 됩니다.
+    #        만약 변환이 실패해서 숫자 월이 남아있다면, convert_relative_time의 로직을 개선해야 합니다.
 
     return year, month, day, hour
 

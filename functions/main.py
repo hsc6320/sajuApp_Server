@@ -1,5 +1,5 @@
 from curses import meta
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 import hashlib
 import logging
 import os
@@ -168,12 +168,9 @@ def get_cached_answer(question: str, session_id: str = "") -> Optional[Tuple[str
     
     # TTL 체크
     if age > CACHE_TTL_SECONDS:
-        # 만료된 캐시 삭제
         del _ANSWER_CACHE[cache_key]
-        print(f"[CACHE] 만료된 캐시 삭제 (age={age}s)")
         return None
     
-    print(f"[CACHE] ✅ 캐시 히트 (age={age}s, key={cache_key[:16]}...)")
     return (answer, age)
 
 def save_to_cache(question: str, answer: str, session_id: str = "") -> None:
@@ -189,14 +186,11 @@ def save_to_cache(question: str, answer: str, session_id: str = "") -> None:
     
     # 캐시 크기 제한 (LRU 방식)
     if len(_ANSWER_CACHE) >= CACHE_MAX_SIZE:
-        # 가장 오래된 항목 삭제
         oldest_key = min(_ANSWER_CACHE.keys(), key=lambda k: _ANSWER_CACHE[k][1])
         del _ANSWER_CACHE[oldest_key]
-        print(f"[CACHE] 캐시 용량 초과 → 가장 오래된 항목 삭제")
     
     cache_key = normalize_question(question, session_id)
     _ANSWER_CACHE[cache_key] = (answer, time.time())
-    print(f"[CACHE] 💾 답변 저장 (key={cache_key[:16]}..., total={len(_ANSWER_CACHE)})")
 
 
 # ============================================================================
@@ -327,15 +321,13 @@ def hydrate_history_from_store(session_id: str) -> int:
     # 2. GCS/JSON에서 세션 데이터 로드
     # ──────────────────────────────────────────────────────────────
     try:
-        db = _db_load()  # ★ 현재 user 컨텍스트 기반 파일을 로드함
-    except Exception as e:
-        print(f"[HYDRATE][ERR] load failed: {e}")
+        db = _db_load()
+    except Exception:
         return 0
 
     sess = (db.get("sessions") or {}).get(session_id)
     if not sess:
-        print(f"[HYDRATE] no session '{session_id}' in store")
-        _HYDRATED_SESSIONS.add(session_id)  # 없다는 사실도 캐시해 재시도 낭비 방지
+        _HYDRATED_SESSIONS.add(session_id)
         return 0
 
     turns = list(sess.get("turns") or [])
@@ -370,11 +362,7 @@ def hydrate_history_from_store(session_id: str) -> int:
         
         injected += 1
 
-    # ──────────────────────────────────────────────────────────────
-    # 5. 중복 방지 플래그 설정 및 로그
-    # ──────────────────────────────────────────────────────────────
     _HYDRATED_SESSIONS.add(session_id)
-    print(f"[HYDRATE] ⚡ injected={injected} turns into session='{session_id}' (요약 없음, LLM 호출 0회)")
     return injected
 
 
@@ -473,9 +461,6 @@ def record_turn(user_text: str, assistant_text: str, payload: dict | None = None
     # ❌ 기존: global_memory.save_context() → LLM 호출하여 요약 생성 (16초)
     # ✅ 개선: 아무것도 하지 않음 (JSON 저장은 record_turn_message에서 처리)
     
-    # 상태 로그 (옵션)
-    print_summary_state()
-    print("================== record_turn end (최적화: LLM 호출 없음) ==================\n")
 
     
     
@@ -491,18 +476,15 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         try:
             data = req.get_json(silent=True) or {}
         except Exception as e:
-            print(f"[WARN] JSON 파싱 실패: {e}")
             # 요청 본문을 직접 읽어서 확인
             try:
                 raw_data = req.get_data(as_text=True)
-                print(f"[DEBUG] 요청 본문 (raw): {raw_data[:200] if raw_data else '(empty)'}")
                 if raw_data:
                     # 전역에서 이미 import된 json 모듈 사용 (함수 내부 재-import 시 UnboundLocalError 발생 가능)
                     data = json.loads(raw_data)
                 else:
                     data = {}
             except Exception as e2:
-                print(f"[ERROR] 요청 본문 파싱 실패: {e2}")
                 return https_fn.Response(
                     response=json.dumps({
                         "error": "잘못된 요청 형식입니다. JSON 형식으로 요청해주세요.",
@@ -588,25 +570,19 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         # [ADD] 앱 UID (새로운 경로 구조용)
         app_uid = (data.get("app_uid") or data.get("appUid") or data.get("uid") or "").strip()
         
-        # ✅ [NEW] 개인맞춤입력 정보 (사주 구조 계산에는 사용하지 않음, 해석·조언의 현실 적합도 보정용 context로만 사용)
-        # 디버깅: 프론트엔드에서 보낸 개인맞춤입력 관련 키 확인
+        # ✅ 개인맞춤입력 정보 (해석·조언의 현실 적합도 보정용)
         personal_info_keys = ["jobStatus", "jobName", "maritalStatus", "concerns", "lifeStage", 
                              "moneyActivity", "relationshipStatus", "hobbies", "traits", 
                              "hasHealthConcern", "note"]
         found_keys = [key for key in personal_info_keys if key in data and data.get(key) not in (None, "", [])]
         
-        # personalInfo 또는 personal_info 같은 중첩 객체로 올 수도 있음
         personal_info_obj = None
         if "personalInfo" in data:
-            print(f"[DEBUG] 'personalInfo' 객체 발견: {json.dumps(data.get('personalInfo'), ensure_ascii=False)}")
             personal_info_obj = data.get("personalInfo") or {}
         elif "personal_info" in data:
-            print(f"[DEBUG] 'personal_info' 객체 발견: {json.dumps(data.get('personal_info'), ensure_ascii=False)}")
             personal_info_obj = data.get("personal_info") or {}
         
         if found_keys:
-            print(f"[DEBUG] 개인맞춤입력 관련 키 발견 (루트 레벨): {found_keys}")
-            # 루트 레벨에서 직접 가져오기
             personal_info = {
                 # A. 필수
                 "jobStatus": data.get("jobStatus") or None,
@@ -626,8 +602,6 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 "note": data.get("note") or None,
             }
         elif personal_info_obj:
-            print(f"[DEBUG] 중첩 객체에서 개인맞춤입력 정보 추출")
-            # 중첩 객체에서 가져오기
             personal_info = {
                 "jobStatus": personal_info_obj.get("jobStatus") or None,
                 "jobName": personal_info_obj.get("jobName") or None,
@@ -642,8 +616,6 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 "note": personal_info_obj.get("note") or None,
             }
         else:
-            print(f"[DEBUG] 개인맞춤입력 관련 키 없음. data의 모든 키: {list(data.keys())}")
-            # 루트 레벨에서 직접 가져오기 (기본값으로 빈 값)
             personal_info = {
                 # A. 필수
                 "jobStatus": data.get("jobStatus") or None,
@@ -684,17 +656,14 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         else:
             reset_flag = str(raw_reset).strip().lower() in ("1", "true", "t", "yes", "y")
 
-        print(f"[RESET] raw={raw_reset!r} → flag={reset_flag}")
-
         if reset_flag:
             # 현재 컨텍스트의 파일을 지운다 (gs://.../<user_id>.json 또는 로컬 파일)
             
             uid = get_current_user_id()
             target_path = _resolve_store_path_for_user(uid) if uid else "(no-uid)"
             ok = delete_current_user_store()
-            print(f"[RESET] delete {uid} → {target_path} → ok={ok}")
 
-            # 컨텍스트 정리 후 바로 종료(중요)
+            # 컨텍스트 정리 후 바로 종료
             set_current_user_context(reset=True)
             return https_fn.Response(
                 response=json.dumps({"reset": bool(ok), "user_id": uid, "path": target_path}, ensure_ascii=False),
@@ -709,8 +678,6 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             delete_history_flag = raw_delete_history
         else:
             delete_history_flag = str(raw_delete_history).strip().lower() in ("1", "true", "t", "yes", "y")
-
-        print(f"[DELETE_HISTORY] raw={raw_delete_history!r} → flag={delete_history_flag}")
 
         if delete_history_flag:
             # 현재 컨텍스트의 파일을 지운다 (gs://.../<user_id>.json 또는 로컬 파일)
@@ -731,9 +698,8 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             uid = get_current_user_id()
             target_path = _resolve_store_path_for_user(uid) if uid else "(no-uid)"
             ok = delete_current_user_store()
-            print(f"[DELETE_HISTORY] delete {uid} → {target_path} → ok={ok}")
 
-            # 컨텍스트 정리 후 바로 종료(중요)
+            # 컨텍스트 정리 후 바로 종료
             set_current_user_context(reset=True)
             return https_fn.Response(
                 response=json.dumps({"delete_history": bool(ok), "user_id": uid, "path": target_path}, ensure_ascii=False),
@@ -749,9 +715,8 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 db = _db_load()
                 sess_id = (data.get("session_id") or "single_global_session")
                 sess = (db.get("sessions") or {}).get(sess_id) or {"meta": {"session_id": sess_id}, "turns": []}
-                uid = get_current_user_id() or ""   # ← 안전하게 호출
+                uid = get_current_user_id() or ""
                 path = _resolve_store_path_for_user(uid) if uid else "unknown"
-                print(f"[FETCH_HISTORY] user_id={uid}, session_id={sess_id}, path={path}, turns={len(sess.get('turns', []))}")
                 return https_fn.Response(
                     response=json.dumps(
                         {
@@ -766,9 +731,6 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                     headers={"Content-Type": "application/json; charset=utf-8"}
                 )
             except Exception as e:
-                print(f"[FETCH_HISTORY][ERROR] {e}")
-                import traceback
-                traceback.print_exc()
                 return https_fn.Response(
                     response=json.dumps({
                         "error": f"히스토리 로드 실패: {str(e)}",
@@ -799,12 +761,10 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             last_req = _RECENT_REQUESTS[request_key]
             delta = now - last_req["time"]
             
-            if delta <= 60:  # 60초 이내 중복
+            if delta <= 60:
                 status = last_req.get("status", "processing")
                 
                 if status == "done":
-                    # 이미 완료된 요청 → 캐시 반환 (실제론 GCS에서 가져와야 하지만, 여기선 처리중 반환)
-                    print(f"[DEDUP-MEMORY] ✅ 중복 감지 (완료됨, {delta:.1f}초 전, hydration skip)")
                     return https_fn.Response(
                         response=json.dumps({
                             "answer": "이전 요청을 처리 완료했습니다. 잠시 후 다시 시도해주세요.",
@@ -814,8 +774,6 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                         headers={"Content-Type": "application/json; charset=utf-8"}
                     )
                 else:
-                    # 처리 중인 요청 → 대기 메시지
-                    print(f"[DEDUP-MEMORY] ⚠️ 중복 감지 (처리 중, {delta:.1f}초 전, hydration skip)")
                     return https_fn.Response(
                         response=json.dumps({
                             "answer": "이전 요청을 처리 중입니다. 잠시만 기다려주세요.",
@@ -827,7 +785,6 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         
         # 3) 새 요청 기록
         _RECENT_REQUESTS[request_key] = {"time": now, "status": "processing"}
-        print(f"[DEDUP-MEMORY] 새 요청 기록: {request_key[:50]}...")
 
         # [ENHANCED] 중복 요청 방지 (Client Retry 방어 강화)
         # ⭐ Hydration 전에 먼저 체크 → 중복이면 30초 절약!
@@ -862,7 +819,6 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                     # 3) 시간 윈도우 체크 (60초 이내 중복 감지)
                     last_ts_str = last_user_turn.get("ts") or ""
                     try:
-                        from datetime import datetime, timedelta, timezone
                         if last_ts_str:
                             if last_ts_str.endswith("+0900"):
                                 last_ts_str = last_ts_str[:-5] + "+09:00"
@@ -871,8 +827,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                             delta_sec = (now_dt - last_dt).total_seconds()
                         else:
                             delta_sec = 0
-                    except Exception as te:
-                        print(f"[DEDUP] 시간 파싱 실패: {te}")
+                    except Exception:
                         delta_sec = 0
                     
                     # 4) 60초 이내 중복이면 처리
@@ -881,15 +836,12 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                         if (last_asst_turn and 
                             _turns_dedup.index(last_asst_turn) > _turns_dedup.index(last_user_turn)):
                             cached_answer = last_asst_turn.get("text") or ""
-                            print(f"[DEDUP] ✅ 중복 감지 (캐시 반환, hydration skip): {delta_sec:.1f}초 전")
                             return https_fn.Response(
                                 response=json.dumps({"answer": cached_answer}, ensure_ascii=False),
                                 status=200,
                                 headers={"Content-Type": "application/json; charset=utf-8"}
                             )
                         else:
-                            # 4-2) 응답이 아직 없음 → 처리 중
-                            print(f"[DEDUP] ⚠️  중복 감지 (처리 중, hydration skip): {delta_sec:.1f}초 전")
                             return https_fn.Response(
                                 response=json.dumps({
                                     "answer": "이전 요청을 처리 중입니다. 잠시만 기다려주세요.",
@@ -898,41 +850,29 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                                 status=202,
                                 headers={"Content-Type": "application/json; charset=utf-8"}
                             )
-                    else:
-                        print(f"[DEDUP] ℹ️  동일 질문이지만 시간 초과 ({delta_sec:.1f}초) → 새 요청으로 처리")
                         
-        except Exception as e:
-            print(f"[DEDUP] 체크 실패 (무시): {e}")
-            import traceback
-            traceback.print_exc()
+        except Exception:
+            pass
 
-        # ⭐ [CACHE CHECK] 캐시된 답변 확인 (OpenAI 호출 전)
-        # - 동일 질문 재요청 시 30초 → 1초로 단축
-        # - Flutter에서 cached 필드로 UI 차별화 가능
-        print(f"[CACHE] 캐시 확인 중... (question={question[:30]}...)")
+        # ⭐ [CACHE CHECK] 캐시된 답변 확인
         cached_result = get_cached_answer(question, session_id)
         if cached_result:
             cached_answer, cache_age = cached_result
-            print(f"[CACHE] ✅ 캐시된 답변 반환 (age={cache_age}s, saved ~30s)")
             
-            # 컨텍스트 정리 후 응답
             set_current_user_context(reset=True)
             _ctx = False
             
             return https_fn.Response(
                 response=json.dumps({
                     "answer": cached_answer,
-                    "cached": True,              # ✅ Flutter UI 표시용
+                    "cached": True,
                     "cache_age_seconds": cache_age
                 }, ensure_ascii=False),
                 status=200,
                 headers={"Content-Type": "application/json; charset=utf-8"}
             )
-        else:
-            print(f"[CACHE] 캐시 미스 → OpenAI 호출 진행")
 
-        # ⭐ 중복이 아닐 때만 Hydration 실행 (30초 걸림)
-        print(f"[HYDRATE] Starting hydration for session={session_id}")
+        # Hydration 실행
         hydrate_history_from_store(session_id)
                 
                 
@@ -952,207 +892,10 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         updated_question = updated_question or parsed_meta.get("updated_question") or question
 
         print(f"[CRT] abs={parsed_meta.get('absolute_keywords')} / updated='{updated_question}'")
+        print(f"[간지 변환] 원본 질문: '{question}' → 변환된 질문: '{updated_question}'")
         
-        # ============================================================================
-        # 📋 Flutter에서 받은 사주 정보 전체 로그
-        # ============================================================================
-        print("=" * 80)
-        print("📥 [FLUTTER 요청 데이터 전체 로그]")
-        print("=" * 80)
-        print(f"🧑 이름: {user_name}")
-        print(f"📅 생년월일: {user_birth}")
-        print(f"🆔 앱 UID: {app_uid}")
-        print(f"🔑 세션 ID: {session_id}")
-        print(f"🎯 모드: {mode}")
-        print("-" * 80)
-        print(f"🌿 간지 정보 (sajuganji):")
-        print(f"   년주: {year}")
-        print(f"   월주: {month}")
-        print(f"   일주: {day}")
-        print(f"   시주: {pillar_hour}")
-        print(f"   전체 객체: {json.dumps(sajuganji, ensure_ascii=False)}")
-        print("-" * 80)
-        print(f"📊 대운 정보:")
-        print(f"   대운 배열: {daewoon}")
-        print(f"   대운 문자열: {daewoon_str}")
-        print(f"   현재 대운: {current_daewoon}")
-        print(f"   대운 시작 나이: {first_luck_age}")
-        # 나이대별 대운 계산 및 출력 (년도, 십성, 십이운성 포함)
-        if isinstance(daewoon, list) and first_luck_age is not None:
-            from core.services import calculate_daewoon_by_age, _extract_birth_year
-            from Sipsin import _norm_stem
-            birth_year = _extract_birth_year(user_birth)
-            # 일간 정보 추출 (십성 계산용)
-            day_stem_hj = None
-            if ilGan:
-                try:
-                    day_stem_hj = _norm_stem(ilGan)
-                except Exception:
-                    pass
-            daewoon_by_age = calculate_daewoon_by_age(daewoon, first_luck_age, birth_year, day_stem_hj)
-            if daewoon_by_age:
-                print(f"   나이대별 대운:")
-                for item in daewoon_by_age:
-                    year_range = item.get('year_range', '')
-                    age_range = item.get('age_range', '')
-                    daewoon_ganji = item.get('daewoon', '')
-                    sipseong = item.get('sipseong', '')
-                    sipseong_branch = item.get('sipseong_branch', '')
-                    sibi_unseong = item.get('sibi_unseong', '')
-                    
-                    # 기본 정보
-                    if year_range:
-                        line = f"     {year_range}년: {age_range}세: {daewoon_ganji}"
-                    else:
-                        line = f"     {age_range}세: {daewoon_ganji}"
-                    
-                    # 십성과 십이운성 정보 추가
-                    sipseong_parts = []
-                    if sipseong:
-                        sipseong_parts.append(f"천간 십성={sipseong}")
-                    if sipseong_branch:
-                        sipseong_parts.append(f"지지 십성={sipseong_branch}")
-                    if sibi_unseong:
-                        sipseong_parts.append(f"십이운성={sibi_unseong}")
-                    
-                    if sipseong_parts:
-                        line += f" ({', '.join(sipseong_parts)})"
-                    
-                    print(line)
-        print("-" * 80)
-        print(f"☯️ 십성 정보:")
-        print(f"   음양: {yinYang}")
-        print(f"   오행: {fiveElement}")
-        print(f"   년간/년지: {yearGan}/{yearJi}")
-        print(f"   월간/월지: {wolGan}/{wolJi}")
-        print(f"   일간/일지: {ilGan}/{ilJi}")
-        print(f"   시간/시지: {siGan}/{siJi}")
-        print(f"   대운간/대운지: {currDaewoonGan}/{currDaewoonJi}")
-        print(f"   전체 sipseong_info 객체: {json.dumps(sipseong_info, ensure_ascii=False)}")
-        print("-" * 80)
-        # 십이신살 계산 및 출력
-        try:
-            from sip_e_un_sung import pillars_sinsal
-            from Sipsin import branch_from_any
-            
-            # 일지 추출 (일주에서 지지 추출)
-            day_branch = branch_from_any(day) if day else None
-            
-            if day_branch:
-                # 년/월/일/시 지지 추출
-                pillars_branches = {
-                    "year":  branch_from_any(year) if year else None,
-                    "month": branch_from_any(month) if month else None,
-                    "day":   branch_from_any(day) if day else None,
-                    "hour":  branch_from_any(pillar_hour) if pillar_hour else None,
-                }
-                
-                # 십이신살 계산 (일지 기준)
-                sinsal_map = pillars_sinsal(day_branch, pillars_branches)
-                
-                print(f"🔮 십이신살 정보 (일지={day_branch} 기준):")
-                if sinsal_map.get("year"):
-                    print(f"   년지({pillars_branches.get('year')}): {sinsal_map.get('year')}")
-                if sinsal_map.get("month"):
-                    print(f"   월지({pillars_branches.get('month')}): {sinsal_map.get('month')}")
-                if sinsal_map.get("day"):
-                    print(f"   일지({pillars_branches.get('day')}): {sinsal_map.get('day')}")
-                if sinsal_map.get("hour"):
-                    print(f"   시지({pillars_branches.get('hour')}): {sinsal_map.get('hour')}")
-                
-                # 전체 신살 맵 출력
-                print(f"   전체 십이신살 맵: {json.dumps(sinsal_map, ensure_ascii=False)}")
-            else:
-                print(f"🔮 십이신살 정보: 일지 추출 실패 (일주={day})")
-        except Exception as e:
-            print(f"🔮 십이신살 계산 중 오류: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # 4대 흉살 계산 및 출력
-        try:
-            from sip_e_un_sung import check_4dae_hyungsal
-            hyungsal_result = check_4dae_hyungsal(year, month, day, pillar_hour)
-            
-            print(f"⚔️ 4대 흉살 정보:")
-            if hyungsal_result.get("baekhosal"):
-                print(f"   백호살: {', '.join(hyungsal_result.get('baekhosal', []))}")
-            if hyungsal_result.get("goegangsal"):
-                print(f"   괴강살: {', '.join(hyungsal_result.get('goegangsal', []))}")
-            if hyungsal_result.get("yanginsal"):
-                print(f"   양인살: {', '.join(hyungsal_result.get('yanginsal', []))}")
-            if hyungsal_result.get("guimungwansal"):
-                print(f"   귀문관살: {', '.join(hyungsal_result.get('guimungwansal', []))}")
-            
-            # 전체 4대 흉살 맵 출력
-            has_any = any(hyungsal_result.values())
-            if not has_any:
-                print(f"   (4대 흉살 없음)")
-            else:
-                print(f"   전체 4대 흉살 맵: {json.dumps(hyungsal_result, ensure_ascii=False)}")
-        except Exception as e:
-            print(f"⚔️ 4대 흉살 계산 중 오류: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # ✅ [NEW] 개인맞춤입력 정보 로그 출력
-        print("-" * 80)
-        print(f"👤 개인맞춤입력 정보:")
-        if personal_info and any(v for v in personal_info.values() if v):
-            # A. 필수
-            if personal_info.get("jobStatus"):
-                print(f"   직업 상태: {personal_info.get('jobStatus')}")
-            if personal_info.get("jobName"):
-                print(f"   직업명: {personal_info.get('jobName')}")
-            if personal_info.get("maritalStatus"):
-                print(f"   혼인 상태: {personal_info.get('maritalStatus')}")
-            if personal_info.get("concerns"):
-                concerns_list = personal_info.get("concerns", [])
-                if isinstance(concerns_list, list) and concerns_list:
-                    print(f"   현재 고민 영역: {', '.join(concerns_list)}")
-            
-            # B. 권장
-            if personal_info.get("lifeStage"):
-                print(f"   현재 삶의 단계: {personal_info.get('lifeStage')}")
-            if personal_info.get("moneyActivity"):
-                print(f"   재물 활동: {personal_info.get('moneyActivity')}")
-            if personal_info.get("relationshipStatus"):
-                print(f"   연애 상태: {personal_info.get('relationshipStatus')}")
-            
-            # C. 보조(선택)
-            if personal_info.get("hobbies"):
-                hobbies_list = personal_info.get("hobbies", [])
-                if isinstance(hobbies_list, list) and hobbies_list:
-                    print(f"   취미 성향: {', '.join(hobbies_list)}")
-            if personal_info.get("traits"):
-                traits_dict = personal_info.get("traits", {})
-                if isinstance(traits_dict, dict) and traits_dict:
-                    traits_str = ", ".join([f"{k}: {v}" for k, v in traits_dict.items() if v])
-                    if traits_str:
-                        print(f"   성향 자각: {traits_str}")
-            
-            # D. 민감(제한 입력)
-            if personal_info.get("hasHealthConcern") is not None:
-                health_status = "있음" if personal_info.get("hasHealthConcern") else "없음"
-                print(f"   건강 이슈 존재 여부: {health_status}")
-            
-            # E. 기타사항(선택)
-            if personal_info.get("note"):
-                note_text = personal_info.get("note", "")
-                if len(note_text) > 200:
-                    note_text = note_text[:200] + "..."
-                print(f"   기타 메모: {note_text}")
-            
-            # 전체 객체도 JSON으로 출력 (디버깅용)
-            print(f"   전체 객체: {json.dumps(personal_info, ensure_ascii=False)}")
-        else:
-            print(f"   (개인맞춤입력 정보 없음)")
-        
-        print("-" * 80)
-        print(f"❓ 질문:")
-        print(f"   원본: {question}")
-        print(f"   변환 후: {updated_question}")
-        print("=" * 80)
+        # ✅ 요청 수신 로그 (간소화)
+        print(f"📥 요청 수신: {user_name} | 모드: {mode} | 질문: {question[:50]}{'...' if len(question) > 50 else ''}")
         
         {
             # print("===========================테스트 코드 ===============================")
@@ -1574,33 +1317,13 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             # context에 나이대별 대운 정보, comparison_block, 개인맞춤입력 정보 추가
             enhanced_context = reg_prompt + daewoon_context + comparison_context + personal_info_context
             
-            # ✅ [DEBUG] 개인맞춤입력 정보가 context에 포함되었는지 확인
-            if personal_info_context:
-                print("=" * 80)
-                print("🔍 [DEBUG] LLM 프롬프트에 전달되는 개인맞춤입력 정보:")
-                print("=" * 80)
-                print(personal_info_context)
-                print("=" * 80)
-                # enhanced_context에서 개인맞춤입력 정보 부분만 추출해서 확인
-                if "[개인맞춤입력 정보]" in enhanced_context:
-                    start_idx = enhanced_context.find("[개인맞춤입력 정보]")
-                    # 개인맞춤입력 정보 섹션의 끝을 찾기 (다음 섹션이나 끝까지)
-                    end_markers = ["[CONTEXT]", "[FACTS]", "[입력 데이터(JSON)]", "[사용자 질문]"]
-                    end_idx = len(enhanced_context)
-                    for marker in end_markers:
-                        marker_idx = enhanced_context.find(marker, start_idx)
-                        if marker_idx != -1 and marker_idx < end_idx:
-                            end_idx = marker_idx
-                    personal_section = enhanced_context[start_idx:end_idx]
-                    print(f"✅ 개인맞춤입력 정보가 enhanced_context에 포함됨 (길이: {len(personal_section)} 문자)")
-                    print(f"📝 개인맞춤입력 정보 섹션 미리보기:\n{personal_section[:500]}...")
-                else:
-                    print("⚠️ [WARN] enhanced_context에 '[개인맞춤입력 정보]' 섹션이 없습니다!")
-            else:
-                print("⚠️ [DEBUG] personal_info_context가 비어있습니다. (개인맞춤입력 정보가 context에 포함되지 않음)")
+            # 현재 날짜 정보 (KST 기준)
+            current_date_obj = datetime.now(timezone(timedelta(hours=9)))
+            current_date_str = current_date_obj.strftime("%Y년 %m월 %d일 %A")
             
             result = chat_with_memory.invoke(
                 {
+                    "current_date": current_date_str,                   # 현재 날짜 정보 (날짜 관련 질문 처리용)
                     "context": enhanced_context,                        # 회귀/컨텍스트 전문 + 나이대별 대운
                     "facts": facts_json,                                # 구조화 FACT
                     "summary": summary_text,                            # moving_summary_buffer
@@ -1618,65 +1341,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             )
             answer_text = getattr(result, "content", str(result))
             
-            # ✅ [DEBUG] LLM 응답에서 개인맞춤입력 정보 반영 여부 확인
-            if personal_info_data and any(v for v in personal_info_data.values() if v):
-                print("=" * 80)
-                print("🔍 [DEBUG] LLM 응답에서 개인맞춤입력 정보 반영 여부 확인:")
-                print("=" * 80)
-                # 개인맞춤입력 정보의 주요 키워드 추출
-                keywords_to_check = []
-                if personal_info_data.get("jobStatus"):
-                    keywords_to_check.append(personal_info_data.get("jobStatus"))
-                if personal_info_data.get("jobName"):
-                    keywords_to_check.append(personal_info_data.get("jobName"))
-                if personal_info_data.get("maritalStatus"):
-                    keywords_to_check.append(personal_info_data.get("maritalStatus"))
-                if personal_info_data.get("concerns"):
-                    keywords_to_check.extend(personal_info_data.get("concerns", []))
-                if personal_info_data.get("moneyActivity"):
-                    keywords_to_check.append(personal_info_data.get("moneyActivity"))
-                if personal_info_data.get("relationshipStatus"):
-                    keywords_to_check.append(personal_info_data.get("relationshipStatus"))
-                
-                # 응답에서 키워드 포함 여부 확인 (공백 제거 후 비교, 부분 매칭 지원)
-                found_keywords = []
-                answer_text_normalized = answer_text.replace(" ", "").replace("\n", "")
-                for keyword in keywords_to_check:
-                    if keyword:
-                        # 정확한 매칭
-                        if keyword in answer_text:
-                            found_keywords.append(keyword)
-                        else:
-                            # 공백 제거 후 비교 (예: "소프트웨어개발자" vs "소프트웨어 개발자")
-                            keyword_normalized = keyword.replace(" ", "")
-                            if keyword_normalized in answer_text_normalized:
-                                found_keywords.append(f"{keyword} (공백 제거 후 매칭)")
-                            else:
-                                # 부분 매칭 (키워드의 일부가 포함되어 있는지)
-                                # 예: "직업/커리어" -> "직업" 또는 "커리어"가 포함되어 있으면
-                                if "/" in keyword:
-                                    parts = keyword.split("/")
-                                    for part in parts:
-                                        if part in answer_text:
-                                            found_keywords.append(f"{keyword} (부분 매칭: {part})")
-                                            break
-                
-                if found_keywords:
-                    print(f"✅ 개인맞춤입력 정보가 응답에 반영됨!")
-                    print(f"   발견된 키워드: {', '.join(found_keywords)}")
-                    print(f"   전체 키워드: {', '.join(keywords_to_check)}")
-                else:
-                    print(f"⚠️ 개인맞춤입력 정보 키워드가 응답에 직접 언급되지 않음")
-                    print(f"   확인한 키워드: {', '.join(keywords_to_check)}")
-                    print(f"   (키워드가 직접 언급되지 않아도 맥락적으로 반영되었을 수 있음)")
-                
-                # 응답의 일부 미리보기
-                preview_length = min(300, len(answer_text))
-                print(f"\n📝 응답 미리보기 (처음 {preview_length}자):")
-                print(answer_text[:preview_length] + "..." if len(answer_text) > preview_length else answer_text)
-                print("=" * 80)
-
-            # ✅ 토큰 사용량 로깅 (gpt-4o-mini 기준)
+            # ✅ 토큰 사용량 로깅
             usage = getattr(result, "usage_metadata", None) or getattr(result, "response_metadata", {}).get("token_usage") if hasattr(result, "response_metadata") else None
             try:
                 if isinstance(usage, dict):
@@ -1703,22 +1368,18 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 payload=user_payload,
             )
 
-            # 👇 여기서 세션 히스토리를 max_history 개까지만 유지
+            # 세션 히스토리를 max_history 개까지만 유지
             try:
-                print(f"[DBG] trim-call: data.max_history={data.get('max_history')} MAX_TURNS={MAX_TURNS} → using max_history={max_history}")
-                trimmed = trim_session_history(session_id, max_history)
-                if trimmed:
-                    print(f"[TRIM] session_id={session_id} 에 대해 히스토리 잘라냄 (max={max_history})")
-            except Exception as te:
-                print(f"[TRIM] trim_session_history 예외: {te}")
+                trim_session_history(session_id, max_history)
+            except Exception:
+                pass
                 
-            # ⭐ 요청 완료 - 메모리 상태 업데이트
+            # 요청 완료 - 메모리 상태 업데이트
             _req_key = f"{session_id}:{question}"
             if _req_key in _RECENT_REQUESTS:
                 _RECENT_REQUESTS[_req_key]["status"] = "done"
-                print(f"[DEDUP-MEMORY] 요청 완료 표시")
             
-            # ⭐ [CACHE SAVE] 답변을 캐시에 저장 (다음 요청을 위해)
+            # 답변을 캐시에 저장
             answer_text = result.content
             save_to_cache(question, answer_text, session_id)
             

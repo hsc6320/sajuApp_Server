@@ -143,10 +143,6 @@ def get_wolju_from_date(
             ):
                 selected_item = item
                 closest_solar_date = current_solar
-                print(
-                    f"[WOLJU-MONTH] month-only match: target={solar_date.date()} "
-                    f"→ 기준일={current_solar.date()} 월주={item.get('월주')}"
-                )
                 break
 
     # -----------------------------
@@ -166,17 +162,12 @@ def get_wolju_from_date(
                 continue
 
     if selected_item is None or closest_solar_date is None:
-        print("[WOLJU] no matching record in json_data")
         return None
-
-    print(f"음력 변환 일 : {selected_item}")
-    print(f"[DEBUG] get_wolju_from_date input: {solar_date}, month_only={month_only}")
 
     # 1. 년간 추출
     year_stem = selected_item["년주"].strip()[0]
     group_index = get_year_group_index(year_stem)
     if group_index == -1:
-        print(f"[WOLJU] invalid year stem from {selected_item['년주']}")
         return None
 
     # 2. 절기 기준으로 월 인덱스 계산
@@ -187,25 +178,24 @@ def get_wolju_from_date(
     else:
         # 소한 이후부터 각 절기를 순회하며 해당하는 월 인덱스 찾기
         month_index = -1
-        for i, term in enumerate(solar_terms):
+        # 입력 날짜 이하의 절기 중 가장 큰 절기를 찾아야 함
+        # 소한은 전년도 12월을 의미하므로, 소한 이후 날짜에서는 소한을 제외하고 찾아야 함
+        # 역순으로 순회하되 소한(인덱스 11)은 제외
+        for i in range(len(solar_terms) - 2, -1, -1):  # 역순 순회 (소한 제외: len-2부터 0까지)
+            term = solar_terms[i]
             term_year = solar_date.year
             term_date = datetime(term_year, term["month"], term["day"])
-            # 해당 절기 이후인 경우 해당 월 인덱스로 설정
             if solar_date >= term_date:
                 month_index = i
+                break  # 역순이므로 첫 번째로 만족하는 것이 가장 큰 절기
         
-        # 만약 어떤 절기도 만족하지 않으면 (이론적으로 발생하지 않아야 함)
+        # 만약 입춘~대설 중 어떤 절기도 만족하지 않으면 소한을 선택 (1월 5일 ~ 입춘 전)
         if month_index == -1:
-            month_index = 11  # 안전장치: 전년도 12월로 처리
-
-    print(
-        f"[DEBUG] Solar Term Index: {month_index} "
-        f"(Date: {solar_date.date()}, Term: {solar_terms[month_index] if month_index >= 0 else 'None'})"
-    )
-
+            month_index = 11  # 소한 (전년도 12월)
+    
     # 4) 테이블에서 '월주(천간+지지)'를 그대로 반환
     wolju = month_stem_table[group_index][month_index]
-    print(f"[DEBUG] Result Wolju: {wolju}")
+    print(f"[월주 계산] 최종 결과: {wolju}")
     return wolju
 
 
