@@ -570,7 +570,9 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         # [ADD] 앱 UID (새로운 경로 구조용)
         app_uid = (data.get("app_uid") or data.get("appUid") or data.get("uid") or "").strip()
         
+        
         # ✅ 개인맞춤입력 정보 (해석·조언의 현실 적합도 보정용)
+        # ⚠️ 중요: 요청에 개인맞춤입력 정보가 없으면 명시적으로 빈 값으로 초기화하여 이전 사용자 데이터가 남지 않도록 함
         personal_info_keys = ["jobStatus", "jobName", "maritalStatus", "concerns", "lifeStage", 
                              "moneyActivity", "relationshipStatus", "hobbies", "traits", 
                              "hasHealthConcern", "note"]
@@ -578,30 +580,44 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
         
         personal_info_obj = None
         if "personalInfo" in data:
-            personal_info_obj = data.get("personalInfo") or {}
+            personal_info_obj = data.get("personalInfo")
+            # 빈 딕셔너리나 None이면 None으로 설정
+            if personal_info_obj == {}:
+                personal_info_obj = None
         elif "personal_info" in data:
-            personal_info_obj = data.get("personal_info") or {}
+            personal_info_obj = data.get("personal_info")
+            # 빈 딕셔너리나 None이면 None으로 설정
+            if personal_info_obj == {}:
+                personal_info_obj = None
+        
+        # personal_info_obj가 있고 실제 값이 있는지 확인
+        has_personal_info_obj = False
+        if personal_info_obj and isinstance(personal_info_obj, dict):
+            # personal_info_obj에 실제 값이 있는지 확인
+            has_personal_info_obj = any(v for v in personal_info_obj.values() if v not in (None, "", [], {}))
         
         if found_keys:
+            # 요청의 개별 필드에서 직접 가져오기
             personal_info = {
                 # A. 필수
-                "jobStatus": data.get("jobStatus") or None,
-                "jobName": data.get("jobName") or None,
-                "maritalStatus": data.get("maritalStatus") or None,
-                "concerns": data.get("concerns") or [],
+                "jobStatus": data.get("jobStatus") if "jobStatus" in data else None,
+                "jobName": data.get("jobName") if "jobName" in data else None,
+                "maritalStatus": data.get("maritalStatus") if "maritalStatus" in data else None,
+                "concerns": data.get("concerns") if "concerns" in data else [],
                 # B. 권장
-                "lifeStage": data.get("lifeStage") or None,
-                "moneyActivity": data.get("moneyActivity") or None,
-                "relationshipStatus": data.get("relationshipStatus") or None,
+                "lifeStage": data.get("lifeStage") if "lifeStage" in data else None,
+                "moneyActivity": data.get("moneyActivity") if "moneyActivity" in data else None,
+                "relationshipStatus": data.get("relationshipStatus") if "relationshipStatus" in data else None,
                 # C. 보조(선택)
-                "hobbies": data.get("hobbies") or [],
-                "traits": data.get("traits") or {},
+                "hobbies": data.get("hobbies") if "hobbies" in data else [],
+                "traits": data.get("traits") if "traits" in data else {},
                 # D. 민감(제한 입력)
                 "hasHealthConcern": data.get("hasHealthConcern") if "hasHealthConcern" in data else None,
                 # E. 기타사항(선택)
-                "note": data.get("note") or None,
+                "note": data.get("note") if "note" in data else None,
             }
-        elif personal_info_obj:
+        elif has_personal_info_obj:
+            # personal_info_obj에서 가져오기
             personal_info = {
                 "jobStatus": personal_info_obj.get("jobStatus") or None,
                 "jobName": personal_info_obj.get("jobName") or None,
@@ -616,24 +632,42 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 "note": personal_info_obj.get("note") or None,
             }
         else:
+            # ⚠️ 요청에 개인맞춤입력 정보가 없으면 명시적으로 빈 값으로 초기화
+            # 이전 사용자의 데이터가 남지 않도록 모든 필드를 None 또는 빈 값으로 설정
             personal_info = {
                 # A. 필수
-                "jobStatus": data.get("jobStatus") or None,
-                "jobName": data.get("jobName") or None,
-                "maritalStatus": data.get("maritalStatus") or None,
-                "concerns": data.get("concerns") or [],
+                "jobStatus": None,
+                "jobName": None,
+                "maritalStatus": None,
+                "concerns": [],
                 # B. 권장
-                "lifeStage": data.get("lifeStage") or None,
-                "moneyActivity": data.get("moneyActivity") or None,
-                "relationshipStatus": data.get("relationshipStatus") or None,
+                "lifeStage": None,
+                "moneyActivity": None,
+                "relationshipStatus": None,
                 # C. 보조(선택)
-                "hobbies": data.get("hobbies") or [],
-                "traits": data.get("traits") or {},
+                "hobbies": [],
+                "traits": {},
                 # D. 민감(제한 입력)
-                "hasHealthConcern": data.get("hasHealthConcern") if "hasHealthConcern" in data else None,
+                "hasHealthConcern": None,
                 # E. 기타사항(선택)
-                "note": data.get("note") or None,
+                "note": None,
             }
+        
+        # ✅ 개인맞춤입력 정보 로그 (핵심 정보만)
+        personal_info_summary = []
+        if personal_info.get("jobStatus"):
+            personal_info_summary.append(f"직업상태:{personal_info.get('jobStatus')}")
+        if personal_info.get("jobName"):
+            personal_info_summary.append(f"직업명:{personal_info.get('jobName')}")
+        if personal_info.get("maritalStatus"):
+            personal_info_summary.append(f"혼인상태:{personal_info.get('maritalStatus')}")
+        if personal_info.get("concerns"):
+            concerns_str = ",".join(personal_info.get("concerns", []))[:30]  # 최대 30자
+            personal_info_summary.append(f"고민:{concerns_str}")
+        if personal_info_summary:
+            print(f"[개인맞춤입력] {', '.join(personal_info_summary)}")
+        else:
+            print(f"[개인맞춤입력] 없음 (초기화됨)")
         
         # [NEW] 이 요청 동안만 '해당 사용자' 파일로 라우팅되도록 켠다
         #       (Cloud Run/Functions 재사용 프로세스 대비, 요청 끝나면 반드시 해제)
@@ -1260,7 +1294,8 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
             # ✅ [NEW] 개인맞춤입력 정보를 context에 추가 (있으면)
             personal_info_context = ""
             personal_info_data = user_payload.get("meta", {}).get("personal_info", {})
-            if personal_info_data and any(v for v in personal_info_data.values() if v):
+            has_personal_info = personal_info_data and any(v for v in personal_info_data.values() if v)
+            if has_personal_info:
                 # 개인맞춤입력 정보가 있을 때만 context에 추가
                 personal_lines = []
                 personal_lines.append("[개인맞춤입력 정보]")
@@ -1313,6 +1348,7 @@ def ask_saju(req: https_fn.Request) -> https_fn.Response:
                 
                 if len(personal_lines) > 1:  # "[개인맞춤입력 정보]" 헤더 외에 실제 정보가 있으면
                     personal_info_context = "\n\n" + "\n".join(personal_lines) + "\n"
+                    print(f"[개인맞춤입력] context에 추가됨 ({len(personal_lines)-1}개 필드)")
             
             # context에 나이대별 대운 정보, comparison_block, 개인맞춤입력 정보 추가
             enhanced_context = reg_prompt + daewoon_context + comparison_context + personal_info_context

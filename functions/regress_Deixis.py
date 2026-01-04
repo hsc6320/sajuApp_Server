@@ -13,6 +13,7 @@ from typing import Dict, Any, Tuple, List, Optional
 import os, re, json
 from datetime import datetime
 
+from langchain_core.prompts import ChatPromptTemplate
 from regress_conversation import _extract_meta, _llm_detect_regression, _db_load
 
 # ─────────────────────────────────────────────────────────────
@@ -222,6 +223,206 @@ def _find_place_anchor_from_json(
     return None, {"source":"none", "searched":searched}
 
 # ─────────────────────────────────────────────────────────────
+# Step A: LLM 회귀 판정 (의미 기반, 룰/마커 제거)
+# ─────────────────────────────────────────────────────────────
+
+_CONTINUATION_DETECT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """너는 "대화 회귀 여부 판정기"다.
+아래의 "직전 assistant 답변"과 "현재 user 질문"을 보고,
+현재 질문이 직전 답변을 전제로 의미적으로 이어지는 질문인지 판정하라.
+
+규칙:
+- 추측 금지. 텍스트 근거가 약하면 False.
+- "이전 답변을 전제(그 답변의 결론/내용/선택지/설명을 바탕으로)" 하면 True.
+- 완전히 새 주제면 False.
+- 출력은 JSON만. 다른 텍스트 금지.
+
+출력 스키마:
+{{
+  "is_continuation": true/false,
+  "confidence": 0.0-1.0,
+  "reason": "한 문장"
+}}
+"""),
+    ("user", """직전 assistant 답변:
+<<<
+{prev_assistant_text}
+>>>
+
+현재 user 질문:
+<<<
+{current_question}
+>>>
+
+JSON만 출력.""")
+])
+
+
+def _llm_detect_continuation_v2(question: str, prev_assistant_text: str) -> dict:
+    """
+    LLM으로 회귀 여부 판정 (의미 기반, 마커/룰 없음)
+    
+    Args:
+        question: 현재 user 질문
+        prev_assistant_text: 직전 assistant 답변 (최근 300자)
+    
+    Returns:
+        {
+            "is_continuation": bool,
+            "confidence": float,
+            "reason": str
+        }
+    """
+    try:
+        import os
+        from langchain_openai import ChatOpenAI
+        
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            print("[REG][STEP-A] OPENAI_API_KEY not set")
+            return {
+                "is_continuation": False,
+                "confidence": 0.0,
+                "reason": "api_key_missing"
+            }
+        
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            max_tokens=200,
+            timeout=15,
+            openai_api_key=api_key,
+            model_kwargs={"response_format": {"type": "json_object"}}
+        )
+        
+        chain = _CONTINUATION_DETECT_PROMPT | llm
+        result = chain.invoke({
+            "prev_assistant_text": prev_assistant_text[:300],  # 최근 300자만
+            "current_question": question
+        })
+        
+        import json
+        data = json.loads(result.content if hasattr(result, "content") else str(result))
+        
+        # 기본값 보정
+        data.setdefault("is_continuation", False)
+        data.setdefault("confidence", 0.0)
+        data.setdefault("reason", "")
+        
+        return data
+        
+    except Exception as e:
+        print(f"[REG][STEP-A] LLM 판정 실패: {e}")
+        return {
+            "is_continuation": False,
+            "confidence": 0.0,
+            "reason": f"exception: {e}"
+        }
+
+
+
+# ─────────────────────────────────────────────────────────────
+# Step B: 이전 결론 LLM 정제 (회귀일 때만, 토픽 키워드 없이)
+# ─────────────────────────────────────────────────────────────
+
+_REFINE_CONCLUSIONS_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """너는 대화 요약기다. 새 판단을 만들지 말고, 이미 나온 판단만 정제/요약한다.
+
+🚨 핵심 규칙 (절대 준수):
+1. **텍스트에 없는 내용은 만들지 마라.**
+2. **가능하면 빈 배열로 두어라.** (불확실하면 비우기)
+3. 추정/해석 금지. 명시적으로 나온 결론만 추출.
+
+출력 JSON:
+{{
+  "decisions": ["이전에 도출된 핵심 결론 (명확한 것만)"],
+  "key_points": ["중요 판단 요지"],
+  "open_questions": ["아직 답 안 된 핵심 질문"],
+  "constraints": ["보수적 접근", "리스크 회피" 등 조건/제약],
+  "confidence": 0.0~1.0
+}}
+
+confidence 가이드:
+- 명확한 결론이 여러 개 → 0.8~1.0
+- 일부 결론만 명확 → 0.5~0.7
+- 애매하거나 추정 필요 → 0.3 이하
+- 결론 없음 → 0.0 (빈 배열)
+"""),
+    ("user", """최근 답변들:
+{assistant_messages}
+
+현재 질문:
+{current_question}
+
+JSON만 출력.""")
+])
+
+def _refine_conclusions_with_llm(rows_fmt: List[dict], current_question: str) -> dict:
+    """
+    LLM으로 이전 결론 정제 (토픽 키워드 없이 의미 기반)
+    
+    Returns:
+        {
+            "decisions": [...],
+            "key_points": [...],
+            "open_questions": [...],
+            "constraints": [...],
+            "confidence": 0.0~1.0
+        }
+    """
+    if not rows_fmt:
+        return {"decisions": [], "key_points": [], "open_questions": [], "constraints": [], "confidence": 0.0}
+    
+    # 최근 assistant 답변 2~4개만 (비용 최소화)
+    assistant_msgs = [r for r in rows_fmt if r.get("role") == "assistant"][-4:]
+    if not assistant_msgs:
+        return {"decisions": [], "key_points": [], "open_questions": [], "constraints": [], "confidence": 0.0}
+    
+    assistant_text = "\n\n".join([f"[답변{i+1}] {m.get('text', '')[:200]}" for i, m in enumerate(assistant_msgs)])
+    
+    try:
+        # LLM 호출
+        import os
+        from langchain_openai import ChatOpenAI
+        
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            print("[REFINE] OPENAI_API_KEY not set")
+            return {"decisions": [], "key_points": [], "open_questions": [], "constraints": [], "confidence": 0.0}
+        
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            max_tokens=400,
+            timeout=15,
+            openai_api_key=api_key,
+            model_kwargs={"response_format": {"type": "json_object"}}
+        )
+        
+        chain = _REFINE_CONCLUSIONS_PROMPT | llm
+        result = chain.invoke({
+            "assistant_messages": assistant_text,
+            "current_question": current_question
+        })
+        
+        import json
+        data = json.loads(result.content if hasattr(result, "content") else str(result))
+        
+        # 기본값 보정
+        data.setdefault("decisions", [])
+        data.setdefault("key_points", [])
+        data.setdefault("open_questions", [])
+        data.setdefault("constraints", [])
+        data.setdefault("confidence", 0.0)
+        
+        return data
+        
+    except Exception as e:
+        print(f"[REFINE] LLM 정제 실패: {e}")
+        return {"decisions": [], "key_points": [], "open_questions": [], "constraints": [], "confidence": 0.0}
+
+
+# ─────────────────────────────────────────────────────────────
 # 지시어 해석 → FACT 생성
 # ─────────────────────────────────────────────────────────────
 def _resolve_deixis_and_make_facts(question: str, *, session_id: str, meta_now: dict) -> dict:
@@ -272,159 +473,177 @@ def build_regression_and_deixis_context(
     question: str,
     summary_text: str,
     *,
-    session_id: str,          # ★ 반드시 세션 ID를 외부에서 주입
+    session_id: str,
 ) -> Tuple[str, dict]:
     """
-    (프롬프트, 디버그메타) 를 반환.
-    동작 순서:
-      1) 세션 히스토리 게이트(첫 턴이면 회귀 False)
-      2) LLM 회귀 판정(_llm_detect_regression)  ← 키워드 규칙 X, LLM 판단만 사용
-      3) 지시어(이때/거기/그 사람 등) 감지 → JSON에서 시간/장소 앵커 복원 후 FACT 주입
-      4) 회귀=True면 JSON에서 실제 과거 턴을 스코어링하여 상위 N개 맥락 선택
-      5) FACT/컨텍스트를 붙여 LLM 프롬프트 구성 (없으면 원문 그대로)
-    로그 프리픽스:
-        [REG][IN] : 회귀 빌더 진입 시 입력값/환경 요약(세션ID, 질문 등)
-        [REG][HIST] : 세션 히스토리 상태(과거 턴 유무/개수) → 회귀 가능 여부의 1차 게이트
-        [REG][META] : 현재 발화에서 추출한 메타(키워드, kind, 노트 등)
-        [REG][LLM] : LLM 회귀판정의 원시 결과/최종 결정(신뢰도, 이유)
-        [REG][DEIX] : 지시어(이때/그때/그곳/그 사람 등) 해석으로 복원된 FACT들(날짜/장소/만남)
-        [REG][SCAN] : JSON에서 과거 맥락 스코어링 결과(검색수, 선별수, 사용수)
-        [REG][OUT] : LLM에 넘길 최종 프롬프트(줄 수/문자 수 요약)
-        [JSON_SCAN] : 실제 conversations.json 스캔 작업의 요약(총 턴, 스코어링/픽 개수)
-        [DEIXIS][TIME] : 시간 앵커(절대 날짜) 탐색 스캔 로그
-        [DEIXIS][PLACE] : 장소 앵커(장소 키워드) 탐색 스캔 로그
+    🎯 하이브리드 회귀 처리 (Rule + LLM 정제)
+    
+    Pipeline:
+      Step A: Rule-based 회귀 판정 (대화 구조만)
+      Step B: LLM 이전 결론 정제 (의미 기반, 토픽 키워드 ❌)
+      Step C: 조건부 memory_summary 주입 (confidence ≥ 임계치)
+    
+    Returns:
+        (프롬프트, 디버그메타)
     """
-
-    # ─────────────────────────────────────────────────────────
-    # 내부용: 긴 문자열 로그를 줄여 보기 좋게
-    # ─────────────────────────────────────────────────────────
     def _brief(s: str, n: int = 140) -> str:
         if not s:
             return ""
         s = str(s).replace("\n", " ").strip()
         return (s[:n] + "…") if len(s) > n else s
-
-    # 0) 입력 확인
+    
     print(f"[REG][IN] session_id={session_id}")
     print(f"[REG][IN] question='{_brief(question)}'")
-    #print(f"[REG][IN] summary_text='{_brief(summary_text)}'")
-
-    # 1) 히스토리 게이트: 세션에 저장된 과거 턴이 없으면 회귀 불가
+    
+    # ─────────────────────────────────────────────────────────
+    # 1) 히스토리 게이트 (첫 턴이면 회귀 불가)
+    # ─────────────────────────────────────────────────────────
     hist = _get_history_stats(session_id=session_id)
-    #print(f"[REG][HIST] has_history={hist.get('has_history')} turns={hist.get('history_turns')}")       #회귀 로그: [REG][HIST] has_history=True 가 떠야 함.
     if not hist.get("has_history"):
-        dbg = {"llm": {"is_regression": False, "confidence": 0.0}, "reason": "first_turn_no_history"}
-    #    print("[REG][HIST] first turn → regression=False (hard gate)")
+        dbg = {"step": "A", "is_continuation": False, "confidence": 0.0, "reason": "first_turn"}
         return question, dbg
-
-    # ⭐ 2+3) 병렬 실행: 메타 추출 + 회귀 판정을 동시에 수행 (4-6초 → 2-3초)
-    from concurrent.futures import ThreadPoolExecutor
     
-    meta_now = {"msg_keywords": [], "kind": None, "notes": ""}
-    reg = {"is_regression": False, "confidence": 0.0, "topic_keywords": [], "explicit_markers": [], "reasons": "exception"}
+    # ─────────────────────────────────────────────────────────
+    # Step A: LLM 회귀 판정 (의미 기반)
+    # ─────────────────────────────────────────────────────────
+    # 직전 assistant 답변 가져오기
+    from regress_conversation import _db_load
+    db = _db_load()
+    sessions = db.get("sessions") or {}
+    sess = sessions.get(session_id) or {}
+    turns = list(sess.get("turns") or [])
     
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        # 두 LLM 호출을 동시에 시작
-        meta_future = executor.submit(_extract_meta, question)
-        reg_future = executor.submit(_llm_detect_regression, question, summary_text, hist)
-        
-        # 메타 추출 결과 대기
-        try:
-            meta_now = meta_future.result(timeout=10)
-        except Exception as e:
-            print(f"[REG][META] exception in _extract_meta: {e}")
-            meta_now = {"msg_keywords": [], "kind": None, "notes": ""}
-        
-        # 회귀 판정 결과 대기  
-        try:
-            reg = reg_future.result(timeout=10)
-        except Exception as e:
-            print(f"[REG][LLM] exception in _llm_detect_regression: {e}")
-            reg = {"is_regression": False, "confidence": 0.0, "topic_keywords": [], "explicit_markers": [], "reasons": "exception"}
+    prev_assistant_text = ""
+    for t in reversed(turns):
+        if t.get("role") == "assistant":
+            prev_assistant_text = t.get("text", "")[:500]  # 최근 500자
+            break
     
-    print(f"[REG][META] now={meta_now}")
-    print(f"[REG][LLM] raw={reg}")
-
-    conf_th = float(os.environ.get("REG_CONF_THRESH", "0.65"))
-    is_reg = bool(reg.get("is_regression")) and float(reg.get("confidence", 0.0)) >= conf_th
-    print(f"[REG][LLM] decision is_reg={is_reg} (conf={reg.get('confidence')}, th={conf_th}) reason='{_brief(reg.get('reasons',''))}'")
-
-    # 공통 디버그 스켈레톤
-    debug: Dict[str, Any] = {
-        "llm": {
-            "is_regression": bool(reg.get("is_regression", False)),
-            "confidence": float(reg.get("confidence", 0.0)),
-            "topic_keywords": reg.get("topic_keywords", []),
-            "explicit_markers": reg.get("explicit_markers", []),
-            "reasons": reg.get("reasons", ""),
-        },
-        "search": {
-            "context_used": 0, "searched_total": 0, "now_keywords": [],
-            "now_kind": meta_now.get("kind"), "scored": 0, "filtered_by_min_sim": 0, "picked": 0,
-        },
-        "facts": {}
-    }
-
-    # 4) 지시어 FACT (회귀 여부와 무관하게 항상 시도)
+    continuation_result = _llm_detect_continuation_v2(question, prev_assistant_text)
+    print(f"[REG][STEP-A] is_continuation={continuation_result['is_continuation']} "
+          f"confidence={continuation_result['confidence']:.2f} "
+          f"reason='{continuation_result['reason']}'")
+    
+    CONTINUATION_THRESHOLD = 0.75  # ✅ 보수적 임계치
+    
+    # 회귀 아니면 즉시 종료
+    if not continuation_result["is_continuation"] or continuation_result["confidence"] < CONTINUATION_THRESHOLD:
+        dbg = {
+            "step": "A",
+            "is_continuation": continuation_result["is_continuation"],
+            "confidence": continuation_result["confidence"],
+            "reason": continuation_result["reason"],
+            "below_threshold": continuation_result["confidence"] < CONTINUATION_THRESHOLD
+        }
+        return question, dbg
+    
+    # ─────────────────────────────────────────────────────────
+    # Step B: LLM 이전 결론 정제 (회귀일 때만 호출)
+    # ─────────────────────────────────────────────────────────
+    # 최근 대화 컨텍스트 가져오기
+    from regress_conversation import _extract_meta
+    meta_now = _extract_meta(question)
+    
+    # 과거 맥락 검색 (키워드 기반, 상위 4개만)
+    merged_kws = meta_now.get("msg_keywords", [])
+    try:
+        rows_fmt, scan_dbg = _select_context_from_json(
+            merged_kws=merged_kws,
+            target_kind=meta_now.get("kind"),
+            limit_pick=4,  # 비용 최소화
+            session_id=session_id
+        )
+    except Exception as e:
+        print(f"[REG][STEP-B] context scan failed: {e}")
+        rows_fmt, scan_dbg = [], {}
+    
+    # LLM 정제
+    refined = _refine_conclusions_with_llm(rows_fmt, question)
+    decisions_count = len(refined.get("decisions", []))
+    print(f"[REG][STEP-B] refined_confidence={refined['confidence']:.2f} decisions_count={decisions_count}")
+    
+    # ─────────────────────────────────────────────────────────
+    # Step C: 조건부 주입 (보수적)
+    # ─────────────────────────────────────────────────────────
+    CONFIDENCE_THRESHOLD = 0.6
+    
+    if refined["confidence"] < CONFIDENCE_THRESHOLD:
+        print(f"[REG][STEP-C] injected=False reason=low_confidence ({refined['confidence']:.2f} < {CONFIDENCE_THRESHOLD})")
+        dbg = {
+            "step": "C_skipped",
+            "is_continuation": True,
+            "llm_confidence": continuation_result["confidence"],
+            "llm_reason": continuation_result["reason"],
+            "refined_confidence": refined["confidence"],
+            "decisions_count": decisions_count,
+            "injected": False,
+            "reason": "low_confidence"
+        }
+        return question, dbg
+    
+    # ─────────────────────────────────────────────────────────
+    # 프롬프트 구성 (최소화, 자연스러운 문체)
+    # ─────────────────────────────────────────────────────────
+    header = []
+    header.append(f"사용자가 이전 대화를 이어서 질문하고 있습니다. (회귀 신뢰도={continuation_result['confidence']:.2f})")
+    
+    # memory_summary (1~3줄 제한, 태그 형식 피하기)
+    context_lines = []
+    if refined.get("decisions"):
+        decisions_text = ", ".join(refined['decisions'][:2])
+        context_lines.append(f"이전 대화 요약: {decisions_text}")
+    
+    if refined.get("open_questions") and len(context_lines) < 3:
+        context_lines.append(f"현재 질문은 이전 결론을 전제로 함: {refined['open_questions'][0]}")
+    
+    if refined.get("constraints") and len(context_lines) < 3:
+        constraints_text = ", ".join(refined['constraints'][:2])
+        context_lines.append(f"참고: {constraints_text}")
+    
+    # ✅ 최대 3줄까지만 주입
+    if context_lines:
+        header.extend(context_lines[:3])
+    
+    # 지시어 FACT (있으면)
     try:
         facts = _resolve_deixis_and_make_facts(question, session_id=session_id, meta_now=meta_now)
     except Exception as e:
-        print(f"[REG][DEIX] exception in _resolve_deixis_and_make_facts: {e}")
+        print(f"[REG][DEIXIS] failed: {e}")
         facts = {}
-    if facts:
-        debug["facts"].update(facts)
-    #print(f"[REG][DEIX] facts={facts if facts else '{}'}")
-
-    # 5) 회귀=True면 JSON에서 실제 과거 맥락 선택
-    rows_fmt: List[dict] = []
-    if is_reg:
-        merged_kws = list(set((meta_now.get("msg_keywords") or []) + (reg.get("topic_keywords") or [])))
-        print(f"[REG][SCAN] merged_kws={merged_kws} kind={meta_now.get('kind')}")
-        try:
-            rows_fmt, dbg = _select_context_from_json(
-                merged_kws=merged_kws,
-                target_kind=meta_now.get("kind"),
-                limit_pick=8,
-                session_id=session_id,
-            )
-            debug["search"] = {"context_used": len(rows_fmt), **dbg}
-     #       print(f"[REG][SCAN] context_used={len(rows_fmt)} searched_total={dbg.get('searched_total')} "      //[REG][SCAN] context_used=1 searched_total=2 scored=1 picked=1
-     #             f"scored={dbg.get('scored')} picked={dbg.get('picked')}")
-        except Exception as e:
-            print(f"[REG][SCAN] exception in _select_context_from_json: {e}")
-
-    # 6) 프롬프트 구성
-    header: List[str] = []
-    if is_reg:
-        header.append(f"사용자가 과거 대화의 연속을 말하고 있습니다. (회귀 감지: True, 신뢰도={reg.get('confidence',0):.2f})")
-        header.append("다음 과거 대화 맥락을 참고하여 자연스럽게 이어 답하세요.")
-
-    # 지시어 FACT 명시(있을 때만)
-    if "deixis_anchor_date" in debug["facts"]:
-        header.append(f"[FACT] '이때'는 {debug['facts']['deixis_anchor_date']['value']} 을(를) 가리킵니다.")
-    if "deixis_anchor_place" in debug["facts"]:
-        header.append(f"[FACT] '거기/그곳'은 '{debug['facts']['deixis_anchor_place']['value']}' 을(를) 가리킵니다.")
-    if "deixis_person" in debug["facts"]:
-        header.append(f"[FACT] '그 사람'은 {debug['facts']['deixis_person']['value']} 을 의미합니다.")
-
-    # 과거 대화 라인업(있으면)
-    lines = [f"- [{r.get('date','')} {r.get('time','')}] {r.get('role','')}: {r.get('text','')}" for r in rows_fmt]
+    
+    if "deixis_anchor_date" in facts:
+        header.append(f"[FACT] '이때'는 {facts['deixis_anchor_date']['value']}")
+    
+    # 과거 대화 라인업 (간략, 최대 3개)
+    lines = [f"- {r.get('role','')}: {r.get('text','')[:80]}..." for r in rows_fmt[:3]]
+    
     body = "\n".join(header)
     if lines:
-        body += ("\n과거 대화:\n" + "\n".join(lines))
+        body += f"\n\n과거 대화 요약:\n" + "\n".join(lines)
+    
+    prompt = f"{body}\n\n현재 질문: {question}"
+    
+    print(f"[REG][STEP-C] injected=True prompt_length={len(prompt)} chars")
+    
+    dbg = {
+        "step": "C_injected",
+        "is_continuation": True,
+        "llm_confidence": continuation_result["confidence"],
+        "llm_reason": continuation_result["reason"],
+        "refined_confidence": refined["confidence"],
+        "decisions_count": decisions_count,
+        "injected": True,
+        "reason": "confidence_ok",
+        "refined": refined,
+        "facts": facts
+    }
+    
+    return prompt, dbg
 
-    # 최종 프롬프트
-    if body.strip():
-        prompt = f"{body}\n\n현재 발화: {question}"
-        #print(f"[REG][OUT] prompt_lines={len(prompt.splitlines())} chars={len(prompt)}")       //prompt_lines=4 chars=102
-        # 프롬프트 일부 미리보기
-        #print(f"[REG][OUT] preview:\n{_brief(prompt, 320)}")
-        return prompt, debug
 
-    # 컨텍스트/FACT 아무것도 못 붙였으면 원문 그대로
-    print("[REG][OUT] no context/fact → return original question")
-    return question, debug
-
+# ─────────────────────────────────────────────────────────────
+# 브릿지 텍스트 생성 (기존 호환)
+# ─────────────────────────────────────────────────────────────
 def _make_bridge(facts: dict | None) -> str:
     """회귀 시 내부 참고 메모. 답변에 노출 금지 가정."""
     facts = facts or {}
@@ -447,7 +666,7 @@ def _make_bridge(facts: dict | None) -> str:
     
     
     
-from langchain_core.prompts import ChatPromptTemplate
+# ChatPromptTemplate는 이미 상단에서 import됨
 
 counseling_prompt = ChatPromptTemplate.from_messages([
     ("system", """너는 맥락을 정확히 이어주는 한국어 사주 상담가다.

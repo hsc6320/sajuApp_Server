@@ -673,7 +673,6 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
     # 
     # 1) 원국 조후: 원국 기둥(년/월/일/시)만으로 계산
     joohu_natal = get_joohu_flags(year, month, day, pillar_hour)
-    print(f"[make_saju_payload] ✅ 원국 조후 계산: {joohu_natal}")
     
     # 2) 대운 조후: 원국 + 대운을 합쳐서 계산 (대운이 있으면)
     # 월령은 원국 월주를 사용하되, 오행 분포는 원국 + 대운을 합산
@@ -691,7 +690,6 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
             "daewoon": current_dw,  # 대운 추가 (오행 집계에 포함)
         }
         joohu_daewoon = calculate_joohu(month_branch, pillars_with_daewoon)
-        print(f"[make_saju_payload] ✅ 대운 조후 계산 (원국+대운): {joohu_daewoon}")
     
     # 3) 세운(연운) 조후: 원국 + 세운을 합쳐서 계산 (세운이 있으면)
     # 월령은 원국 월주를 사용하되, 오행 분포는 원국 + 세운을 합산
@@ -708,7 +706,6 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
             "hour": pillar_hour,
         }
         joohu_seun = calculate_joohu(month_branch, pillars_with_seun)
-        print(f"[make_saju_payload] ✅ 세운 조후 계산 (원국+세운): {joohu_seun}")
     
     # 4) 월운 조후: 원국 + 월운을 합쳐서 계산 (월운이 있으면)
     # 월령은 원국 월주를 사용하되, 오행 분포는 원국 + 월운을 합산
@@ -725,14 +722,19 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
             "hour": pillar_hour,
         }
         joohu_wolun = calculate_joohu(month_branch, pillars_with_wolun)
-        print(f"[make_saju_payload] ✅ 월운 조후 계산 (원국+월운): {joohu_wolun}")
     
-    # === 조후 데이터 payload 포함 여부 확인 (디버깅용) ===
-    print(f"[make_saju_payload] 🔍 조후 데이터 요약:")
-    print(f"   - 원국 조후: {joohu_natal}")
-    print(f"   - 대운 조후: {joohu_daewoon if joohu_daewoon else 'None (대운 없음)'}")
-    print(f"   - 세운 조후: {joohu_seun if joohu_seun else f'None (세운 없음, t_year_ganji={t_year_ganji})'}")
-    print(f"   - 월운 조후: {joohu_wolun if joohu_wolun else f'None (월운 없음, t_month_ganji={t_month_ganji})'}")
+    # === 조후 계산 완료 (핵심 로그만 유지) ===
+    joohu_summary = []
+    if joohu_natal.get("is_balanced"):
+        joohu_summary.append("원국:균형")
+    if joohu_daewoon and joohu_daewoon.get("is_balanced"):
+        joohu_summary.append("대운:균형")
+    if joohu_seun and joohu_seun.get("is_balanced"):
+        joohu_summary.append("세운:균형")
+    if joohu_wolun and joohu_wolun.get("is_balanced"):
+        joohu_summary.append("월운:균형")
+    if joohu_summary:
+        print(f"[조후] {', '.join(joohu_summary)}")
 
     # 최종 스키마 구성
     payload = {
@@ -988,15 +990,6 @@ def make_saju_payload(data: dict, focus: str, updated_question: str) -> dict:
         }
     }
 
-    # === 조후 데이터 payload 포함 여부 최종 확인 (디버깅용) ===
-    print(f"[make_saju_payload] 🔍 조후 데이터 payload 포함 여부 확인:")
-    print(f"   - payload['natal']['joohu']: {payload.get('natal', {}).get('joohu', 'NOT FOUND')}")
-    print(f"   - payload['current_daewoon']['joohu']: {payload.get('current_daewoon', {}).get('joohu', 'NOT FOUND')}")
-    print(f"   - payload['target_time']['year']['joohu']: {payload.get('target_time', {}).get('year', {}).get('joohu', 'NOT FOUND')}")
-    print(f"   - payload['target_time']['month']['joohu']: {payload.get('target_time', {}).get('month', {}).get('joohu', 'NOT FOUND')}")
-    print(f"   - payload['resolved']['flow_now']['daewoon']['joohu']: {payload.get('resolved', {}).get('flow_now', {}).get('daewoon', {}).get('joohu', 'NOT FOUND')}")
-    print(f"   - payload['resolved']['flow_now']['target']['year']['joohu']: {payload.get('resolved', {}).get('flow_now', {}).get('target', {}).get('year', {}).get('joohu', 'NOT FOUND')}")
-    print(f"   - payload['resolved']['flow_now']['target']['month']['joohu']: {payload.get('resolved', {}).get('flow_now', {}).get('target', {}).get('month', {}).get('joohu', 'NOT FOUND')}")
     
     return payload
 

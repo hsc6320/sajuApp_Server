@@ -407,8 +407,79 @@ def _extract_meta(text: str) -> Dict[str, Any]:
     data["msg_keywords"] = _norm_kw_list(data.get("msg_keywords"))
     if data.get("kind"):
         data["kind"] = str(data["kind"]).strip().lower()
+    
+    # ✅ [NEW] 시간 질문 구조화
+    data["timing_structure"] = _structure_timing_question(text, data)
 
     return data
+
+
+def _structure_timing_question(text: str, meta: dict) -> dict | None:
+    """
+    "언제쯤 수익이 날까?" 같은 시간 질문을 구조화
+    
+    Returns:
+        {
+            "type": "timing_question",
+            "target": "business_income",  # 수익, 합격, 성사 등
+            "granularity": "quarter",     # year, quarter, month
+            "range": "2026",
+            "urgency": "medium"            # high, medium, low
+        }
+    """
+    if not any(tok in text for tok in ["언제", "시기", "타이밍", "몇월", "며칠"]):
+        return None
+    
+    result = {
+        "type": "timing_question",
+        "target": None,
+        "granularity": "quarter",
+        "range": None,
+        "urgency": "medium"
+    }
+    
+    # 타겟 추출
+    if "수익" in text or "돈" in text or "벌" in text:
+        result["target"] = "income"
+    elif "합격" in text or "붙을" in text:
+        result["target"] = "pass"
+    elif "성사" in text or "계약" in text:
+        result["target"] = "deal"
+    elif "만남" in text or "인연" in text:
+        result["target"] = "relationship"
+    else:
+        result["target"] = "general_timing"
+    
+    # 세분도 추정
+    if "년" in text or "올해" in text or "내년" in text:
+        result["granularity"] = "year"
+    elif "분기" in text or "쯤" in text:
+        result["granularity"] = "quarter"
+    elif "월" in text or "몇월" in text:
+        result["granularity"] = "month"
+    elif "일" in text or "며칠" in text:
+        result["granularity"] = "day"
+    
+    # 연도 범위 (meta의 target_date에서 추출)
+    if meta.get("target_date"):
+        try:
+            result["range"] = meta["target_date"][:4]  # YYYY 추출
+        except:
+            pass
+    else:
+        # 텍스트에서 연도 추출
+        import re
+        year_match = re.search(r"20\d{2}", text)
+        if year_match:
+            result["range"] = year_match.group(0)
+    
+    # 긴급도 (고민/불안 등의 단어로 판단)
+    if any(word in text for word in ["급", "빨리", "불안", "걱정", "해야"]):
+        result["urgency"] = "high"
+    elif any(word in text for word in ["천천히", "여유", "궁금"]):
+        result["urgency"] = "low"
+    
+    return result
 
 
     
